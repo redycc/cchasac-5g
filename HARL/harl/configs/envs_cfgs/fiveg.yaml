@@ -1,0 +1,12 @@
+n_bs: 3
+n_ue: 10
+n_rb: 4
+area: 500.0
+p_max_dbm: 30.0
+lambda_intf: 0.1
+episode_length: 200
+hierarchical: False
+# Channel source: "formula" (3GPP path loss) or "deepmimo" (ray-tracing)
+channel_source: "formula"
+deepmimo_cache: "/home/hyc1014/DL/FinalProject/deepmimo_cache"
+ue_pool_size: 10000

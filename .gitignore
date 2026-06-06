@@ -1,0 +1,16 @@
+.claude/
+.codex/
+__pycache__/
+*/__pycache__/
+*.pyc
+*.pid
+*.log
+
+logs/
+tasks/
+deepmimo_cache/
+deepmimo_scenarios/
+
+# Generated experiment outputs
+results/
+H-HASAC/results/

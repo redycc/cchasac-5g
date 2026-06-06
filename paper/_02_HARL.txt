@@ -1,0 +1,2842 @@
+arXiv:2306.10715v6 [cs.MA] 12 Mar 2025  Published as a conference paper at ICLR 2024
+
+                                        MAXIMUM ENTROPY HETEROGENEOUS-AGENT
+                                        REINFORCEMENT LEARNING
+
+                                          Jiarong Liu1,Yifan Zhong1,2, Siyi Hu3,
+                                          Haobo Fu4, Qiang Fu4, Xiaojun Chang3, Yaodong Yang1
+                                          1Institute for AI, Peking University, 2National Key Laboratory of General AI, BIGAI,
+                                          3University of Technology Sydney, 4Tencent AI Lab
+
+                                                                                   ABSTRACT
+
+                                                   Multi-agent reinforcement learning (MARL) has been shown effective for coop-
+                                                   erative games in recent years. However, existing state-of-the-art methods face
+                                                   challenges related to sample complexity, training instability, and the risk of con-
+                                                   verging to a suboptimal Nash Equilibrium. In this paper, we propose a unified
+                                                   framework for learning stochastic policies to resolve these issues. We embed
+                                                   cooperative MARL problems into probabilistic graphical models, from which
+                                                   we derive the maximum entropy (MaxEnt) objective for MARL. Based on the
+                                                   MaxEnt framework, we propose Heterogeneous-Agent Soft Actor-Critic (HASAC)
+                                                   algorithm. Theoretically, we prove the monotonic improvement and convergence
+                                                   to quantal response equilibrium (QRE) properties of HASAC. Furthermore, we
+                                                   generalize a unified template for MaxEnt algorithmic design named Maximum
+                                                   Entropy Heterogeneous-Agent Mirror Learning (MEHAML), which provides any
+                                                   induced method with the same guarantees as HASAC. We evaluate HASAC on six
+                                                   benchmarks: Bi-DexHands, Multi-Agent MuJoCo, StarCraft Multi-Agent Chal-
+                                                   lenge, Google Research Football, Multi-Agent Particle Environment, and Light
+                                                   Aircraft Game. Results show that HASAC consistently outperforms strong base-
+                                                   lines, exhibiting better sample efficiency, robustness, and sufficient exploration.
+
+                                        1 INTRODUCTION
+
+                                        Cooperative multi-agent reinforcement learning (MARL) is a complex problem characterized by the
+                                        difficulty of coordinating individual agent policy improvements to enhance overall performance of
+                                        the entire team. As a result, traditional independent learning methods in MARL often lead to poor
+                                        convergence properties (30; 3). To alleviate these difficulties, the centralized training decentralized
+                                        execution (CTDE) paradigm (5; 19) assumes that global states and teammates' actions and policies
+                                        are accessible during the training phase. This approach leads to the development of competent
+                                        multi-agent policy gradient algorithms (40; 37; 38; 43; 42) as well as value decomposition algorithms
+                                        (27; 24; 41; 26; 33) . Furthermore, heterogeneous-agent mirror learning (HAML) (15) provides a
+                                        template for rigorous algorithmic design, which guarantees any induced algorithm of monotonic
+                                        improvement of joint objective and convergence to Nash equilibrium (NE) (22).
+
+                                        Despite the theoretical soundness of the HAML framework, HAML-derived algorithms suffer from
+                                        two main challenges. First, these methods face challenges attributed to either sample complexity or
+                                        training instability. On-policy algorithms, including HAPPO and HATRPO (13), require new sample
+                                        data for each gradient step, which becomes very expensive as task complexity and agent numbers
+                                        increase. Off-policy algorithms, on the other hand, observe training instability and hyperparameter
+                                        sensitivity (45). Moreover, HAML-derived algorithms suffer from insufficient exploration, which
+                                        can lead to suboptimal NE convergence. This is primarily due to the standard MARL objective they
+                                        maximize, where there always exists a deterministic convergence solution (15; 28) and stochasticity is
+                                        not inherently encouraged. Since the presence of multiple NEs is a frequently observed phenomenon
+                                        in many multi-agent games, these methods can fail to explore sufficiently and prematurely converge
+                                        to a suboptimal NE, as we will show in Section 3.2.
+
+                                        A possible solution to these challenges is to let agents learn stochastic behaviors in a sample-efficient
+                                        way. Similar to the case of single-agent RL (7), in cooperative MARL problems, stochastic policies
+                                        enable effective exploration of the reward landscape, mastery of multiple ways of performing the
+
+                                            Equal contribution. Work done during internship at Institute for AI, Peking University. Corresponding to
+                                        <yaodong.yang@pku.edu.cn>. See our page at https://sites.google.com/view/meharl.
+
+                                                                                                   1
+Published as a conference paper at ICLR 2024
+
+task, and robustness when facing prediction errors (46). Unfortunately, while a number of methods
+have achieved great success in single-agent RL settings (46; 7; 9; 17), solving such stochastic
+policy learning problems in cooperative MARL is challenging. Existing CTDE methods offer no
+convergence guarantee for learning stochastic policies in general cases. Recently, FOP (44) applies
+maximum entropy framework to multi-agent settings via value decomposition. However, FOP only
+provides convergence to the global optimum when a task satisfies the Individual-Global-Optimal
+(IGO) assumption, which limits its applicability in general cooperative MARL problems.
+
+In this paper, we propose the first theoretically-justified actor-critic framework for learning stochastic
+policies in cooperative MARL. Firstly, we model cooperative MARL as a probabilistic graphical
+inference problem (Figure 2), where stochastic policies arise as optimal solutions. Performing
+variational inference in this model leads us to derive the maximum entropy (MaxEnt) MARL objective.
+To maximize this objective, we introduce heterogeneous-agent soft policy iteration (HASPI) which
+ensures the properties of monotonic improvement and convergence to quantal response equilibrium
+(QRE), which is the solution concept corresponding to stochastic policies in game theory (20; 6).
+The key insight behind this theory is the joint soft policy decomposition proposition. Based on
+HASPI, we derive the heterogeneous-agent soft actor-critic (HASAC) algorithm. Furthermore, we
+generalize the HASPI procedure to the Maximum Entropy Heterogeneous-Agent Mirror Learning
+(MEHAML) template, which offers a unified solution to MaxEnt MARL problems and provides the
+same theoretical guarantees for any induced methods as HASAC. We test HASAC on six benchmarks:
+Multi-Agent MuJoCo (MAMuJoCo) (4), Bi-DexHands (2), StarCraft Multi-Agent Challenge (SMAC)
+(25), Google Research Football (GRF) (16), Multi-Agent Particle Environment (MPE) (19), and
+Light Aircraft Game (LAG) (23). Across the majority of benchmark tasks, HASAC consistently
+outperforms strong baselines, exhibiting the advantages of stochastic policies, namely improved
+robustness, higher sample efficiency, and sufficient exploration.
+
+2 RELATED WORK
+
+Multi-agent policy gradient (MAPG) methods have been shown effective for multi-agent cooperation
+tasks (5; 19). Yu et al. (42) discovers the effectiveness of PPO in multi-agent scenarios and introduces
+MAPPO. It inspires CoPPO (39), which preserves monotonic improvement property with a simul-
+taneous update scheme, HAPPO / HATRPO (13), which proves monotonic improvement and NE
+convergence property with a sequential update scheme, and A2PO (34), which preserves per-agent
+monotonic improvement property. Guarantees of HAPPO / HATRPO are enhanced by HAML (15),
+which abstracts a general theoretical framework and leads to several practical algorithms. While these
+methods are effective on challenging benchmarks, we show in Section 3.2 that due to the standard
+objective they optimize, they tend to converge rapidly to a suboptimal NE when in proximity to it.
+Notably, the idea of NE can be considered as a notion of local optimum in cooperative MARL settings,
+and has been studied in many prior works (29; 36; 13; 15). To alleviate suboptimal NE convergence
+problem, we propose to learn stochastic policies, which maximize the MaxEnt MARL objective that
+we derive from probabilistic graphical models. We adopt QRE (20; 6; 11) as the solution concept in
+MaxEnt MARL framework, which generalizes NE when payoffs are perturbed by additional noise.
+
+MaxEnt algorithms have achieved great success in single-agent RL. SQL (7) and SAC (8) learn
+optimal MaxEnt policies through soft Q-iteration and soft policy iteration respectively. They refresh
+SOTA performance, showcasing the robustness and effective exploration of stochastic policy. Levine
+(17) reviews these algorithms from a control as inference perspective. Unfortunately, learning MaxEnt
+policies with theoretical guarantees remains a challenge in cooperative MARL settings. MASQL (36)
+adopts a multi-agent actor-critic architecture similar to MADDPG (19), extending SQL to multi-agent
+settings without providing any theoretical guarantees. FOP (44), on the other hand, is a decomposed
+actor-critic method (4; 35), which utilizes the decomposed critic instead of the centralized critic to
+learn individual policies. It factorizes the optimal joint policy of MaxEnt MARL under the IGO
+assumption (see Appendix A.2 for details), which leads to poor performance in complex scenarios. To
+overcome the constraint of IGO, MACPF (32) learns optimal joint policy during training phase and
+distills independent policies from the optimal joint policy to fulfill decentralized execution. Such a
+procedure can be considered as offline imitating learning, where independent policies strive to mimic
+the behaviors produced by the optimal joint policy, but they still lack the guarantee of converging
+to the optimum. In contrast, our approach is the first MaxEnt actor-critic method with theoretical
+guarantee, presenting an improvement to HAML-based algorithms. We augment the objective with
+entropy, propose HASPI, prove its monotonic improvement and QRE (20; 6; 11) convergence property
+without restrictive assumption, derive HASAC, and establish MEHAML template.
+
+                                                           2
+Published as a conference paper at ICLR 2024
+
+3 PRELIMINARIES
+
+3.1 COOPERATIVE MULTI-AGENT REINFORCEMENT LEARNING
+
+We consider a cooperative Markov game (18) formulated by a tuple N , S, A, r, P, , d. Here,
+                                                                                                                          n
+N = {1, . . . , n} denotes the set of n agents, S is the finite state space, A =                                          i=1  Ai  is         the  joint
+
+action space, where Ai denotes the finite action space of agent i, r : S × A  R is the joint reward
+
+function, P : S × A × S  [0, 1] is the transition probability function,   [0, 1) is the discount
+
+factor, and d  P(X) (where P(X) denotes the set of probability distributions over a set X ) is
+
+initial state distribution. In this work, we use the notation P(X) to denote the power set of a set
+
+X and Sym(n) to denote the set of permutations of integers {1, . . . , n}, known as the symmetric
+
+group. At time step t  {1, . . . , T }, each agent i  N is at state st  S and then takes independent
+
+actions ait  i(·i|st), where i is the policy of agent i. Let at = at1, . . . , ant  A denotes the
+                            n
+joint action and  (·|st) =  i=1  i  ·i|st  denotes the joint policy. We denote the policy space of
+
+agent i as i  ×sS i ·i|s |s  S , and the joint policy space as   1, . . . , n . The
+
+agents receive a joint reward r (st, at) and move to the next state st+1  P (·|st, at). The initial state
+distribution d, the joint policy , and the transition kernel P induce a marginal state distribution at
+
+time t, denoted by t. We define the (unnormalized) marginal state distribution                                                 T              t .  The
+                                                                                                                               t=1
+standard joint objective of all agents is to maximize the expected total reward, defined as1
+
+                                                               T
+
+                            Jstd() = Es1:T 1:T ,a1:T              r (st, at) .                                                                     (1)
+
+                                                       t=1
+
+3.2 LIMITATIONS OF EXISTING COOPERATIVE MARL METHODS
+
+Existing MAPG methods maximizing the standard joint objective (Equation 1), such as MAPPO and
+HAPPO, may fail to find the optimal NE and converge prematurely. We analyze this problem by
+considering a singe-state 2-agent cooperative matrix game as shown in Figure 1.
+
+           Agent 1                                    Agent 1                                                                        Agent 1
+       ABC                                        ABC                                                                            ABC
+A 5 -20 -20                                A 0.36 0.12 0.12                                                               A1 0 0
+B -20 10 -20                               B 0.12 0.04 0.04                                                               B0 0 0
+C -20 -20 20                               C 0.12 0.04 0.04                                                               C0 0 0
+Agent 2
+                                                        Agent 2
+                                                                                                                 Agent 2
+
+(a) Reward matrix                   (b) Initial joint policy                    (c) Final joint policy 
+
+Figure 1: A single-state 2-agent cooperative matrix game. (a) is the reward matrix of joint actions. (b) represents
+the initial joint policy  formed by both agents taking the individual policy  = {0.6, 0.2, 0.2}. (c) represents
+the final joint policy  that MAPPO and HAPPO converge to, deterministically choosing action (A, A).
+
+Agents each choose from three possible actions {A, B, C} and receive a joint reward. In this case,
+(A, A), (B, B), (C, C) are three different NEs with rewards of 5, 10, 20, with (C, C) being the
+optimal NE. To simulate common scenarios where finding the global optima is challenging and, due
+to the learning in the early stages, agents are updated towards some reasonably good local optima
+initially, we consider a setting where agents assign a higher probability to action (A, A), as shown in
+Figure 1b. By exact calculation (see Appendix B), we find traditional algorithms like MAPPO and
+HAPPO converge rapidly towards the suboptimal point (A, A), failing to identify the Pareto-optimal
+equilibria (C, C), as shown in Figure 1c, which is also corroborated by our experiment (Section 5.1).
+
+The explanation is that maximizing the standard joint objective (Equation 1) leads to convergence
+towards the deterministic policies exploiting the local optimum they have explored so far (28).
+Specifically, the standard objective discourages any unilateral deviation from the local optimum as it
+will result in a decrease in the joint reward. As a result, agents tend to deterministically converge to
+the suboptimal NE. To address this issue, we propose to learn stochastic behaviors, which always
+preserve the probability of selecting currently underexplored actions, and will eventually converge
+to the QRE where action probability is proportional to the exponential of action value. We will
+show in the experimental section that our method could successfully converge to the Pareto-optimal
+equilibrium (C, C), even when it has a higher probability of choosing action (A, A) initially.
+
+    1We write ai, a, and s when we refer to the action, joint action, and state as to values, and ai, a, and s as to
+random variable.
+
+                                              3
+Published as a conference paper at ICLR 2024
+
+4 METHOD
+
+In this section, we establish maximum entropy heterogeneous-agent reinforcement learning - a
+framework for learning stochastic policies in cooperative MARL settings, which alleviates the
+suboptimal convergence problem mentioned in Section 3.2. We name it heterogeneous-agent (HA)
+as it is a substantial improvement to HARL (45), its Proposition 1 builds upon the prior advantage
+decomposition lemma (13), and it is generally applicable to HA settings. This framework encompasses
+three key components, including the derivation of MaxEnt MARL objective from a probabilistic
+inference perspective in Section 4.1, the HASPI procedure and HASAC algorithm in Section 4.2, and
+the unified MEHAML template for theoretically-justified algorithmic design in Section 4.3.
+
+4.1 MAXIMUM ENTROPY MULTI-AGENT REINFORCEMENT LEARNING
+
+To formalize the idea of learning stochastic policies                      O1       O2                   O3
+
+ (·|st), we embed cooperative MARL problem into the                            n        n                    n
+PGM (Figure 2). Following Levine (17), we introduce                        a1i      ai2                  a3i
+
+an additional optimality variable Ot, which takes on bi-
+nary values indicating the optimality of joint actions taken
+
+by all agents. Specifically, Ot = 1 denotes that time
+step t is optimal, and we model it as p(Ot = 1|st, at) 
+exp(r(st, at)). Then we use structured variational infer-
+ence to approximate the posterior distribution p( |O1:T =
+
+1)     p(s1)  T    p(st+1|st,  at)    exp       T    r(st,  at  )          s1       s2                   s3               ···
+              t=1                               t=1
+
+over trajectory  with the distribution q( ) =
+
+q(s1)  T    q(st+1|st,  at)q(at|st),  where  we   fix  the  envi-  Figure 2: The probabilistic graphical model
+       t=1
+ronment dynamics q(s1) = p(s1) and q(st+1|st, at) = for cooperative MARL.
+
+p(st+1|st, at) to avoid risk-seeking behaviors (17). This
+
+inference procedure leads to the maximum entropy (MaxEnt) objective of MARL (see Appendix C):
+
+                                                  T                        n
+
+                  J () = Es1:T 1:T ,a1:T               r (st, at) +  H i (·|st) ,                                (2)
+
+                                                t=1                        i=1
+
+where  is the temperature constant that trades off between reward and entropy maximization, and
+when  = 0, the objective is reduced to standard MARL.
+
+Augmenting standard MARL objective with an entropy term (Equation 2) aligns with the solution
+concept of quantal response equilibrium (QRE) proposed by McKelvey & Palfrey (20), which is a
+generalization of the standard notion of Nash equilibrium (NE) in game theory. In a QRE, payoffs are
+perturbed by additive disturbances (entropy term in our case) so that players do not deterministically
+choose the strategy with the highest observed payoff, but rather assign the probability mass in its
+strategies according to every strategy's payoff (6). The following Theorem 1 shows that the QRE
+policies of MaxEnt objective can be represented as Boltzmann distributions:
+
+Theorem 1 (Representation of QRE). A joint policy QRE   is a QRE if none of the agents can
+increase the maximum entropy objective (Equation 2) by unilaterally altering its policy, i.e.,
+
+                          i  N , i  i, J i, Q-RiE  J QRE .
+
+Then the QRE policies are given by
+
+              i  N , Qi RE ai|s :=           exp      E -1                 QQRE     s, ai, a-i
+                                                                a-i Q-RiE
+                                                                                                ,                (3)
+
+                                           biAi exp  E -1 a-iQ-RiE QQRE (s, bi, a-i)
+
+where the soft Q-functions are defined as follows,
+
+Q(s, a) = r (s, a) + Ea1:,s1:P                                                     n            s0 = s, a0 = a .
+                                                                                                                     (4)
+                                                 t     r (st, at) +  H i (·|st)
+
+                                             t=1                                 i=1
+
+Proof can be found in Appendix D. Theorem 1 illustrates the connection between QRE policies and
+
+an  energy-based  model,  where  the  term   1  QQRE   (s,  a)  serves     as  the  negative    energy.  When    >  0,
+                                             
+
+                                                       4
+Published as a conference paper at ICLR 2024
+
+the QRE policies (Equation 3) are no longer deterministic but rather can represent all the ways of
+performing a task. This suggests that the inclusion of entropy term makes the policy QRE stochastic,
+enabling more effective exploration of the environment (21), which is consistent with our initial goal
+of learning stochastic policies in MARL settings.
+
+4.2 HETEROGENEOUS-AGENT SOFT ACTOR-CRITIC
+
+In this subsection, we develop heterogeneous-agent soft policy iteration (HASPI) to maximize MaxEnt
+objective (Equation 2), which alternates between joint soft policy evaluation and heterogeneous-agent
+soft policy improvement, and then derive HASAC based on this theory.
+
+4.2.1 HETEROGENEOUS-AGENT SOFT POLICY ITERATION
+
+In joint soft policy evaluation step of HASPI, we compute soft Q-value from any Q(s, a) : S×A  R
+by repeatedly applying a soft Bellman backup operator  given by:
+
+                                   Q(s, a)  r(s, a) + EsP [V (s)] ,                                  (5)
+
+                                                                     n
+
+                       where V (s) = Ea Q(s, a) +  H i ·i|s .                                        (6)
+
+                                                                     i=1
+
+is the soft value function. We can obtain the soft Q-function of any joint policy  as shown in Lemma
+4.1. Notably, the same method for updating soft Q-function has been proposed in FOP (44) since it is
+the straightforward application of soft Bellman equation.
+
+Lemma 4.1 (Joint Soft Policy Evaluation). Consider the soft Bellman backup operator  and a
+mapping Q0 : S × A  R with |A| < , and define Qk+1 = Qk. Then the sequence Qk will
+converge to the joint soft Q-function  as k  .
+
+Proof can be found in E.1. In policy improvement step, we show that the joint policy  can be
+
+updated based on individual policy updates. To this end, we first introduce the following definition.
+
+Definition 1. Let i1:m = {i1, . . . , im}  N be an ordered subset of agents, and let -i1:m refer to
+its complement. We write ik when we refer to the kth agent in the ordered subset. Correspondingly,
+the multi-agent soft Q-function is defined as
+
+         Qi1:m  s, ai1:m   Ea-i1:m -i1:m          Q s, ai1:m , a-i1:m     +             H i ·i|s . (7)
+            
+
+                                                                               i-i1:m
+
+In  the  case   where  m  =  n,  Qi1:n  s, ai1:n    takes the form Q(s, a), representing the joint soft
+
+                                    
+
+Q-function. When m = 0, i.e., i1:m = , the function represents the soft value function V(s).
+
+With this notation defined, we introduce a pivotal proposition that shows the joint soft policy update
+can be decomposed into a multiplication of sequential local policy updates.
+
+Proposition 1 (Joint Soft Policy Decomposition). Let  be a joint policy, and i1:n  Sym(n) be an
+agent permutation. Suppose that, for each state s and every m = 1, . . . , n,
+
+                                                                           1   i1:m     i1:m-1 im    
+nim ew = arg min DKL im                                                        old                    , (8)
+                                        ·im |s   exp  E Q s, a , · ai1:m-1 nie1w:m-1
+                     im im                      
+                                                        Eai1:m-1 nie1w:m-1 [Zold (s, ai1:m-1 )]
+
+where    ai1:m-1  is  drawn  from  the  policy  i1:m-1  (·|s)  and   the  partition  function  Zold  s, ai1:m-1
+
+                                                  new
+
+normalizes the distribution. Then the joint policy satisfies the following:
+
+                             new = arg min DKL                  exp  Q 1   (s, ·)    .               (9)
+                                                       (·|s) 
+                                                                      old
+
+                                                                     Zold (s)
+
+Proof can be found in E.2. Proposition 1 holds significance due to the crucial insight it provides,
+suggesting that a MaxEnt MARL problem can be considered as a sum of n MaxEnt RL problems.
+It indicates an effective heterogeneous-agent approach to improving the joint soft policy in multi-
+agent learning, where each agent optimizes individual KL-divergence sequentially leading to the
+optimization of joint soft policy. To formally extend the above process into a policy improvement
+procedure with theoretical guarantees of monotonic improvement and convergence to QRE, we
+propose the heterogeneous-agent soft policy improvement as formalized below.
+
+                                                        5
+Published as a conference paper at ICLR 2024
+
+Lemma 4.2 (Heterogeneous-Agent Soft Policy Improvement). Let i1:n  Sym(n) be an agent
+permutation, and for every m = 1, . . . , n, let policy oim ld  im and nim ew be the optimizer of the
+minimization problem defined in Equation 8. Then Qnew (s, a)  Qold (s, a) for all (s, a)  S × A
+with |A| <  and J (new)  J (old).
+
+Proof can be found in E.3. Lemma 4.2 guarantees that soft Q-function and MaxEnt objective
+monotonically increase at each policy improvement step. Next, we propose heterogeneous-agent soft
+policy iteration, which alternates between joint soft policy evaluation and heterogeneous-agent soft
+policy improvement, and prove that joint policy  converges to a QRE.
+
+Theorem 2 (Heterogeneous-Agent Soft Policy Iteration). For any joint policy   , if we
+
+repeatedly apply joint soft policy evaluation and heterogeneous-agent soft policy improvement from
+                                          n
+i  i. Then the joint policy  =            i=1  i  converges        to   QRE        in  Theorem  1.
+
+Proof can be found in E.4. To obtain such theoretical results, the updating approach in Proposition 1
+plays a pivotal role. Lemma 4.2 ensures that, through the updates in Proposition 1, soft Q-function
+increases monotonically, leading to convergence of the policies. Eventually, none of the agents is
+motivated to make an update (Equation 8) at convergence, thereby establishing a QRE.
+
+4.2.2 PRACTICAL ALGORITHM
+
+In practice, large continuous domains require us to derive a practical approximation to the procedure
+
+above. We will use function approximators for both centralized soft Q-function Q (st, at) and
+
+tractable  decentralized  policies  im    aitm |st , for each agent im, parameterized respectively by 
+
+                                      im
+
+and im , and alternate between optimizing both networks with stochastic gradient descent.
+
+The centralized soft Q-function parameters can be trained to minimize the Bellman residual
+
+           JQ() = E(st,at)D         1  Q (st, at) - r (st, at) + Est+1P [V¯ (st+1)]                            2,
+                                    2
+
+where the soft value function is implicitly parameterized through the soft Q-function parameters via
+
+Equation 6. Then we draw a permutation i1:n  Sym(n) and sequentially update the policy of each
+agent im according to Equation 8. The policy parameters can be learned by directly minimizing the
+expected KL-divergence in Equation 8 disregarding the constant log-partition function
+
+                                                                                                                                        
+
+              im          ait1:m-1 i1ni:e1m w:m--1 1 ,aitm imim    log  im         aitm |st     - Qi1:m        st  ,  ai1:m-1  ,  aitm  .
+                                                                          im                            old ;           t
+J ( ) = E E im
+                 st D
+
+                                                                                                                                  (10)
+
+We refer to the above procedure as HASAC and Appendix F for its full pseudocode.
+
+4.3 MAXIMUM ENTROPY HETEROGENEOUS-AGENT MIRROR LEARNING
+
+In addition to updating policies by directly minimizing the KL-divergence in Equation 8, we aim
+
+to propose a generalized HASPI procedure that provides a range of solutions to MaxEnt MARL
+
+problem. To this end, we start by introducing the necessary definitions of the operators proposed in
+HAML (15): the drift functional (HADF) Di ^i|s, ¯ j1:m which, intuitively, is a notion of distance
+between i and ^i, given that agents j1:m just updated to ¯j1:m ; the neighborhood operator Ui i
+which forms a region around the policy i; as well as a sampling distribution   P (S) that is
+continuous in  (see detailed definitions in Appendix A.3). As shown in (15; 14), these operators
+
+allow for effective abstraction of standard RL and MARL methods due to their generality.
+
+We present the generalized HASPI using these operators. In heterogeneous-agent soft policy improve-
+ment step, we redefine the operator that agents optimize as follows,
+
+Definition 2. Let i  N , j1:m  P(-i), and Di be a HADF of agent i. The maximum entropy
+heterogeneous-agent mirror operator (MEHAMO) integrates the soft Q-function as
+
+M V (^i)         (s)  Eaj1:m ¯ j1:m ,ai^i      Qj1:m  ,i  (s,    aj1:m  ,  ai)  -      log  ^i  ai|s  -Di ^i|s, ¯ j1:m .
+     Di,¯ j1:m                                    
+
+Then we propose MEHAML Algorithm template 1 to formalize generalized heterogeneous-agent
+soft policy iteration. Notably, HAML is a special instance of our template when  = 0.
+
+                                                      6
+Published as a conference paper at ICLR 2024
+
+Algorithm 1: Maximum Entropy Heterogeneous-Agent Mirror Learning
+
+Initialise a joint policy 0 = 01, . . . , 0n ;
+for k = 0, 1, · · · do
+
+    Compute the soft Q-function Qk (s, a) for all state-(joint)action pairs (s, a);
+    Update Qk (s, a) according to the soft Bellman equation (Equation 5);
+
+                                            Joint Soft Policy Evaluation
+
+Draw a permutaion i1:n of agents at random;
+for m = 1 : n do
+
+Make       an  update  kim+1  =     arg max      Esk                         ( ) im                 (s) ;
+                                 ( im Uimk kim  )                         M V Dim ,ki1+:m 1 -1 k
+
+                                         (Generalized) Heterogeneous-Agent Soft Policy Improvement
+
+    end
+end
+Output: A limit-point joint policy 
+
+Despite the presence of a drift penalty and a neighborhood constraint, optimizing the MEHAMO
+sequentially is sufficient to guarantee the same desired properties as HASPI. We establish the complete
+list of the core MEHAML properties in Theorem 3, which confirms that any method derived from
+Algorithm 1 has the desired properties of monotonic improvement of the MaxEnt objective and QRE
+convergence (detailed proof can be found in Appendix G).
+
+Theorem 3  (The Core Theorem of MEHAML).                                   Let 0    , and the       sequence of joint policies
+(k)k=0 be  obtained by a MEHAML algorithm 1                               induced  by Di, U i, i     N , and . Then, the
+
+joint policies induced by the algorithm enjoy the following list of properties (1) Attain the monotonic
+
+improvement property J (k+1)  J (k), (2) Their value functions converge to a quantal response
+value function limk Vk = V QRE, (3) Their expected returns converge to a quantal response
+return limk J (k) = JQRE, (4) Their -limit set consists of quantal response equilibria.
+
+Proof sketch. We divide the proof into four steps. In Step 1, we show that the sequence of soft value
+
+function (Vk )kN increases monotonically and converges to a limit point. In Step 2, we show the
+existence of limit points ¯ of (k)kN, and that they are fixed points of the MEHAML update. In the
+most important Step 3, we prove that ¯ is also a fixed point of soft policy iteration by leveraging the
+
+concavity of MEHAMO. Step 4 finalizes the proof, proving that fixed points of soft policy iteration
+
+are QRE policies.
+
+By selecting appropriate HADFs and neighborhood operators that satisfy the definitions, Algo-
+
+rithm 1 has the potential to generate various theoretically-justified algorithms to solve MaxEnt
+MARL problem. The drifts Di ^i|s, ¯ j1:m can serve as soft constraints, such as KL-divergence,
+controlling the distance between ^i and i when the agents j1:m have just updated to ¯ j1:m . Ad-
+ditionally, the neighborhood operators Ui can generate small policy-space subsets, serving as hard
+
+constraints, then the resultant policy improvement will remain within a small range due to the fact
+that i  Ui i , i  N , i  i. Therefore, algorithms equipped with appropriate HADFs
+and neighborhoods can learn stochastic policies in a stable and coordinated manner. In summary,
+
+MEHAML provides a template for generating theoretically sound, stable, monotonically improving
+
+algorithms that enable agents to learn stochastic policies to solve multi-agent cooperation tasks.
+
+5 EXPERIMENTS
+
+To demonstrate the advantages of the stochastic policies learned by HASAC, we conduct compre-
+hensive experiments on the matrix game in Section 3.2 and six benchmarks -- MAMuJoCo (4),
+Bi-DexHands (2), SMAC (25), GRF (16), MPE (19), and LAG (23)2. It is important to note that
+while HASAC is originally designed for continuous actions, we employ a Gumbel-Softmax (10) to
+ensure that HASAC would work for discrete actions. Compared to existing SOTA MAPG methods,
+HASAC achieves the best performance in 31 out of 35 tasks across all benchmarks. In addition to
+final performance, experimental results (see full experimental details and hyperparameter in Appendix
+
+    2HASAC achieves best performance on fully cooperative MPE and LAG tasks. See Appendix H.2.5 and
+H.2.6 for full results.
+
+                                                7
+Published as a conference paper at ICLR 2024
+
+(a) Matrix Game            (b) Catch Abreast          (c) Two Catch Underarm           (d) Lift Underarm
+
+(e) 3x2-Agent HalfCheetah  (f) 6x1-Agent Walker2d     (g) RPS (2 agents)               (h) Corner (11 agents)
+
+              Figure 3: Performance comparisons on selected tasks of multiple benchmarks.
+
+     Map       Difficulty   HASAC       HAPPO      HATRPO       MAPPO        QMIX         FOP      Timesteps
+ 8m_vs_9m        Hard      97.5(1.2)   83.8(4.1)   92.5(3.7)   87.5(4.0)   92.2(1.0)   23.4(1.6)      1e7
+ 5m_vs_6m        Hard      90.0(3.9)   77.5(7.2)   75.0(6.5)   75.0(18.2)  77.3(3.3)   46.9(5.3)      1e7
+                 Hard      100.0(0.0)  97.5(1.2)   93.8(1.2)   96.9(0.7)   89.8(2.5)   93.0(0.8)      1e7
+     3s5z        Hard      95.0(3.1)   87.5(6.7)   98.8(0.6)   96.9(4.8)   95.3(2.2)   12.5(6.2)      1e7
+10m_vs_11m                 97.5(2.4)   88.8(2.0)   97.5(6.4)   93.8(4.7)   87.5(2.5)   37.5(28.1)     2e7
+              Super Hard   82.5(4.1)   66.2(3.1)   72.5(14.7)  70.0(10.7)  87.5(12.6)   0.0(0.0)      2e7
+   MMM2       Super Hard   90.0(10.8)  92.5(13.9)  88.8(2.7)   97.5(1.2)   82.8(4.4)    0.0(0.0)      2e7
+3s5z_vs_3s6z  Super Hard   95.0(3.1)   76.2(3.1)   78.8(0.6)   85.0(2.0)   7.0(27.0)    0.0(0.0)      4e7
+              Super Hard
+   corridor
+  6h_vs_8z
+
+Table 1: Median evaluate winning rate and standard deviation on eight SMAC maps for different methods. All
+values within 1 standard deviation of the maximum score rate are marked in bold.
+
+H) show the following advantages of stochastic policies: (1) HASAC exhibits similar performance
+across different random seeds and higher training stability , (2) HASAC shows higher learning speed
+compared to existing algorithms, and (3) HASAC improves agents' exploration, which facilitates
+policies to escape from suboptimal equilibria and converge towards a higher reward equilibrium.
+
+5.1 EXPERIMENTAL RESULTS
+
+Matrix Game. We show the results of HASAC, HAPPO, MAPPO over 200 learning episodes in
+matrix game (Figure 1a). HASAC escapes local optima and achieves the Pareto optimum due to the
+learned stochastic policies, while the other two methods fall into the suboptimal NE (Figure 3a).
+
+Bi-DexHands. Bi-DexHands offers numerous bimanual manipulation tasks that match various
+human skill levels. In the challenging Catch Abreast, Two Catch Underarm, and Lift Underarm tasks
+(Figure 3b, 3c, and 3d), all on-policy methods fail within 10m steps due to low sample efficiency.
+HATD3 (45), on the other hand, exhibits very high variability and prematurely converges to local
+optima. In contrast, HASAC outperforms the other five methods by a large margin. It also exhibits
+higher convergence speed and improved robustness, demonstrating the benefits of stochastic policies.
+
+Multi-Agent MuJoCo. We compare our method to HAPPO, MAPPO, and HATD3 in ten MAMu-
+JoCo tasks (see Appendix H.2.2). Figure 3e, 3f, and the other results in Appendix H.2.2 demonstrate
+that HASAC enjoys superior performance over the three rivals both in terms of reward values and
+learning speed. It's worth noting that, although both HATD3 and HASAC are off-policy algorithms,
+we generally observe that HASAC learns faster with higher sample efficiency compared to HATD3.
+This is because the exploration mechanism of HATD3 involves adding Gaussian noise to a determin-
+istic policy, resulting in lower exploration efficiency, requiring more samples to explore the reward
+landscape. In contrast, HASAC, due to its inherent encouragement of exploration within stochastic
+policies, can effectively explore the entire reward landscape, thus learning better behaviors rapidly.
+
+StarCraft Multi-Agent Challenge. We evaluate our method on four hard and four super-hard
+maps. As shown in Table 1, HASAC achieves over 90% win rates in 7 out of 8 maps and outperforms
+other strong baselines in most maps. Notably, in particularly challenging tasks such as 5m_vs_6m,
+3s5z_vs_3s5z, and 6h_vs_8z, we observe that HAPPO and HATRPO would converge towards
+suboptimal NE. In addition, FOP is unable to learn meaningful joint policy in super-hard tasks due to
+its reliance on the IGO assumption. By contrast, HASAC consistently achieves superior performance
+
+                                                   8
+Published as a conference paper at ICLR 2024
+
+(a) Stochastic vs. deterministic  (b) Effect of different  on Ant 4x2     (c) Effect of different  on matrix game
+
+Figure 4: Performance comparison between HASAC with different hyperparameters on Ant-v2 4x2 task and
+matrix game. (a) The comparison indicates that stochastic policy can lead to better equilibrium and stabilize
+training. (b) & (c) HASAC converges to different QRE with different temperature parameter .
+
+             Agent 1               Agent 1                       Agent 1                                                                                                          Agent 1
+          ABC                   ABC                        ABC                                                                                                                ABC
+  A1 0 0                A0 0 0                   A 0.0025 0.0025 0.02                                                                                                 A 0.01 0.01 0.1
+  B0 0 0                B0 0 0                   B 0.0025 0.0025 0.02                                                                                                 B 0.01 0.01 0.1
+  C0 0 0                C0 0 1                   C 0.02 0.02 0.91                                                                                                     C 0.1 0.1 0.56
+
+(a) HASAC:  = 1       (b) HASAC:  = 5            (c) HASAC:  = 10                                                                                                  (d) HASAC:  = 15
+Agent 2
+                                               Agent 2
+                                                                                               Agent 2
+                                                                                                                                                          Agent 2
+
+Figure 5: Different temperature  leads to convergence of different QRE.
+
+and shows the ability to identify higher reward equilibria due to its extensive exploration. We also
+observe that HASAC has better stability and higher learning speed across most maps.
+
+Google Research Football. We compare HASAC with QMIX, MAPPO, and HAPPO. As shown
+in Figure 3g and 3h, we generally observe that both MAPPO and HAPPO tend to converge to a
+non-optimal NE on the two challenging tasks, while HASAC exhibits the ability to attain a higher
+reward equilibrium by learning stochastic policies which effectively enhance exploration.
+
+5.2 ABLATION STUDY
+
+We investigate the benefits of stochastic policies learned by HASAC and empirically show how dif-
+ferent temperature  values affect the stochasticity of policies, leading to different QRE convergence.
+Stochasticity. HASAC learns stochastic policies through maximizing the MaxEnt objective (Equa-
+tion 2). We compare it to a deterministic variant which utilizes deterministic policies with fixed
+Gaussian exploration noise to maximize standard MARL objective. The results in Figure 4a show
+that HASAC achieves a higher reward equilibrium and demonstrates better stability compared to the
+deterministic variant, which exhibits high variance across the different runs. These findings highlight
+the importance of learning stochastic policies, which can improve robustness, facilitate escape from
+suboptimal equilibria, and converge to higher reward equilibrium.
+Analysis of temperature . We further show the effect of temperature  on the stochasticity of
+policies. As illustrated in Figure 4b (we report -1 in legend), 4c, and 5, when  is large, policies
+predominantly emphasize maximizing entropy, leading to poor performance due to the failure to
+exploit the reward signal. Conversely, when  is small, MaxEnt objective almost degrades to standard
+objective, leading to suboptimal equilibrium due to inadequate exploration. A proper  achieves a
+trade-off between exploration and exploitation, eventually resulting in better performance. To obtain
+appropriate , we implement both fixed and auto-tuned (see Appendix H.1 for details)  in practice.
+
+6 CONCLUSION
+
+In this paper, we propose maximum entropy heterogeneous-agent reinforcement learning (MEHARL)
+-- a unified framework for learning stochastic policies in MARL. This framework comprises three key
+components, including the PGM derivation of MaxEnt MARL, the HASAC algorithm with monotonic
+improvement and QRE convergence properties, and the unified MEHAML template that provides
+any induced MaxEnt method with the same theoretical guarantees as HASAC. To demonstrate the
+advantages of stochastic policies, we evaluate HASAC on both discrete and continuous control
+tasks, confirming its superior performance and improved robustness and exploration. For future
+work, we aim to explore appropriate drift functionals and neighborhood operators to design more
+principled MaxEnt MARL algorithms that can further enhance performance and stability in multi-
+agent cooperation tasks.
+
+                                              9
+Published as a conference paper at ICLR 2024
+
+Acknowledgements. This work is sponsored by National Natural Science Foundation of China
+(62376013) and Beijing Municipal Science & Technology Commission (Z231100007423015).
+
+REFERENCES
+
+ [1] Lawrence M Ausubel and Raymond J Deneckere. A generalized theorem of the maximum.
+      Economic Theory, 3(1):99­107, 1993.
+
+ [2] Yuanpei Chen, Tianhao Wu, Shengjie Wang, Xidong Feng, Jiechuang Jiang, Stephen Marcus
+      McAleer, Yiran Geng, Hao Dong, Zongqing Lu, Song-Chun Zhu, and Yaodong Yang. Towards
+      human-level bimanual dexterous manipulation with reinforcement learning, 2022.
+
+ [3] Caroline Claus and Craig Boutilier. The dynamics of reinforcement learning in cooperative
+      multiagent systems. AAAI/IAAI, 1998(746-752):2, 1998.
+
+ [4] Christian Schroeder de Witt, Bei Peng, Pierre-Alexandre Kamienny, Philip Torr, Wendelin
+      Böhmer, and Shimon Whiteson. Deep multi-agent reinforcement learning for decentralized
+      continuous cooperative control. arXiv preprint arXiv:2003.06709, 19, 2020.
+
+ [5] Jakob Foerster, Gregory Farquhar, Triantafyllos Afouras, Nantas Nardelli, and Shimon Whiteson.
+      Counterfactual multi-agent policy gradients. In Proceedings of the AAAI conference on artificial
+      intelligence, volume 32, 2018.
+
+ [6] Jacob K Goeree, Charles A Holt, and Thomas R Palfrey. Stochastic game theory for social
+      science: A primer on quantal response equilibrium. In Handbook of Experimental Game Theory,
+      pp. 8­47. Edward Elgar Publishing, 2020.
+
+ [7] Tuomas Haarnoja, Haoran Tang, Pieter Abbeel, and Sergey Levine. Reinforcement learning with
+      deep energy-based policies. In International conference on machine learning, pp. 1352­1361.
+      PMLR, 2017.
+
+ [8] Tuomas Haarnoja, Aurick Zhou, Pieter Abbeel, and Sergey Levine. Soft actor-critic: Off-policy
+      maximum entropy deep reinforcement learning with a stochastic actor, 2018.
+
+ [9] Tuomas Haarnoja, Aurick Zhou, Kristian Hartikainen, George Tucker, Sehoon Ha, Jie Tan,
+      Vikash Kumar, Henry Zhu, Abhishek Gupta, Pieter Abbeel, et al. Soft actor-critic algorithms
+      and applications. arXiv preprint arXiv:1812.05905, 2018.
+
+[10] Eric Jang, Shixiang Gu, and Ben Poole. Categorical reparameterization with gumbel-softmax.
+      arXiv preprint arXiv:1611.01144, 2016.
+
+[11] TS Kozitsina, IV Kozitsin, and IS Menshikov. Quantal response equilibrium for the prisoner's
+      dilemma game in markov strategies. Scientific reports, 12(1):4482, 2022.
+
+[12] Jakub Grudzien Kuba, Muning Wen, Linghui Meng, Haifeng Zhang, David Mguni, Jun Wang,
+      Yaodong Yang, et al. Settling the variance of multi-agent policy gradients. Advances in Neural
+      Information Processing Systems, 34:13458­13470, 2021.
+
+[13] Jakub Grudzien Kuba, Ruiqing Chen, Muning Wen, Ying Wen, Fanglei Sun, Jun Wang, and
+      Yaodong Yang. Trust region policy optimisation in multi-agent reinforcement learning, 2022.
+
+[14] Jakub Grudzien Kuba, Christian Schroeder de Witt, and Jakob Foerster. Mirror learning: A
+      unifying framework of policy optimisation, 2022.
+
+[15] Jakub Grudzien Kuba, Xidong Feng, Shiyao Ding, Hao Dong, Jun Wang, and Yaodong Yang.
+      Heterogeneous-agent mirror learning: A continuum of solutions to cooperative marl. arXiv
+      preprint arXiv:2208.01682, 2022.
+
+[16] Karol Kurach, Anton Raichuk, Piotr Stan´czyk, Michal Zajac, Olivier Bachem, Lasse Espeholt,
+      Carlos Riquelme, Damien Vincent, Marcin Michalski, Olivier Bousquet, et al. Google research
+      football: A novel reinforcement learning environment. In Proceedings of the AAAI conference
+      on artificial intelligence, volume 34, pp. 4501­4510, 2020.
+
+                                                          10
+Published as a conference paper at ICLR 2024
+
+[17] Sergey Levine. Reinforcement learning and control as probabilistic inference: Tutorial and
+      review, 2018.
+
+[18] Michael L Littman. Markov games as a framework for multi-agent reinforcement learning. In
+      Machine learning proceedings 1994, pp. 157­163. Elsevier, 1994.
+
+[19] Ryan Lowe, Yi I Wu, Aviv Tamar, Jean Harb, OpenAI Pieter Abbeel, and Igor Mordatch.
+      Multi-agent actor-critic for mixed cooperative-competitive environments. Advances in neural
+      information processing systems, 30, 2017.
+
+[20] Richard D McKelvey and Thomas R Palfrey. Quantal response equilibria for normal form
+      games. Games and economic behavior, 10(1):6­38, 1995.
+
+[21] Ofir Nachum, Mohammad Norouzi, Kelvin Xu, and Dale Schuurmans. Bridging the gap between
+      value and policy based reinforcement learning. Advances in neural information processing
+      systems, 30, 2017.
+
+[22] John Nash. Non-cooperative games. Annals of mathematics, pp. 286­295, 1951.
+
+[23] Xiaoteng Ma QihanLiu, Yuhua Jiang. Light aircraft game: A lightweight, scalable, gym-
+      wrapped aircraft competitive environment with baseline reinforcement learning algorithms.
+      https://github.com/liuqh16/CloseAirCombat, 2022.
+
+[24] Tabish Rashid, Mikayel Samvelyan, Christian Schroeder de Witt, Gregory Farquhar, Jakob
+      Foerster, and Shimon Whiteson. Qmix: Monotonic value function factorisation for deep
+      multi-agent reinforcement learning, 2018.
+
+[25] Mikayel Samvelyan, Tabish Rashid, Christian Schroeder De Witt, Gregory Farquhar, Nan-
+      tas Nardelli, Tim GJ Rudner, Chia-Man Hung, Philip HS Torr, Jakob Foerster, and Shimon
+      Whiteson. The starcraft multi-agent challenge. arXiv preprint arXiv:1902.04043, 2019.
+
+[26] Kyunghwan Son, Daewoo Kim, Wan Ju Kang, David Earl Hostallero, and Yung Yi. Qtran:
+      Learning to factorize with transformation for cooperative multi-agent reinforcement learning,
+      2019.
+
+[27] Jianyu Su, Stephen Adams, and Peter A. Beling. Value-decomposition multi-agent actor-critics,
+      2020.
+
+[28] Richard S. Sutton and Andrew G. Barto. Reinforcement Learning: An Introduction. The
+      MIT Press, second edition, 2018. URL http://incompleteideas.net/book/
+      the-book-2nd.html.
+
+[29] Brian Swenson, Ryan Murray, and Soummya Kar. On best-response dynamics in potential
+      games. SIAM Journal on Control and Optimization, 56(4):2734­2767, 2018.
+
+[30] Ming Tan. Multi-agent reinforcement learning: Independent vs. cooperative agents. In Proceed-
+      ings of the tenth international conference on machine learning, pp. 330­337, 1993.
+
+[31] J Terry, Benjamin Black, Nathaniel Grammel, Mario Jayakumar, Ananth Hari, Ryan Sullivan,
+      Luis S Santos, Clemens Dieffendahl, Caroline Horsch, Rodrigo Perez-Vicente, et al. Pettingzoo:
+      Gym for multi-agent reinforcement learning. Advances in Neural Information Processing
+      Systems, 34:15032­15043, 2021.
+
+[32] Jiangxing Wang, Deheng Ye, and Zongqing Lu. More centralized training, still decentralized
+      execution: Multi-agent conditional policy factorization, 2023.
+
+[33] Jianhao Wang, Zhizhou Ren, Terry Liu, Yang Yu, and Chongjie Zhang. Qplex: Duplex dueling
+      multi-agent q-learning, 2021.
+
+[34] Xihuai Wang, Zheng Tian, Ziyu Wan, Ying Wen, Jun Wang, and Weinan Zhang. Order matters:
+      Agent-by-agent policy optimization. arXiv preprint arXiv:2302.06205, 2023.
+
+[35] Yihan Wang, Beining Han, Tonghan Wang, Heng Dong, and Chongjie Zhang. {DOP}: Off-
+      policy multi-agent decomposed policy gradients. In International Conference on Learning
+      Representations, 2021. URL https://openreview.net/forum?id=6FqKiVAdI3Y.
+
+                                                          11
+Published as a conference paper at ICLR 2024
+
+[36] Ermo Wei, Drew Wicke, David Freelan, and Sean Luke. Multiagent soft q-learning. arXiv
+      preprint arXiv:1804.09817, 2018.
+
+[37] Ying Wen, Yaodong Yang, Rui Luo, and Jun Wang. Modelling bounded rationality in multi-
+      agent interactions by generalized recursive reasoning. arXiv preprint arXiv:1901.09216, 2019.
+
+[38] Ying Wen, Yaodong Yang, Rui Luo, Jun Wang, and Wei Pan. Probabilistic recursive reasoning
+      for multi-agent reinforcement learning. arXiv preprint arXiv:1901.09207, 2019.
+
+[39] Zifan Wu, Chao Yu, Deheng Ye, Junge Zhang, Hankz Hankui Zhuo, et al. Coordinated proximal
+      policy optimization. Advances in Neural Information Processing Systems, 34:26437­26448,
+      2021.
+
+[40] Yaodong Yang, Rui Luo, Minne Li, Ming Zhou, Weinan Zhang, and Jun Wang. Mean field
+      multi-agent reinforcement learning. In International conference on machine learning, pp.
+      5571­5580. PMLR, 2018.
+
+[41] Yaodong Yang, Jianye Hao, Ben Liao, Kun Shao, Guangyong Chen, Wulong Liu, and Hongyao
+      Tang. Qatten: A general framework for cooperative multiagent reinforcement learning, 2020.
+
+[42] Chao Yu, Akash Velu, Eugene Vinitsky, Jiaxuan Gao, Yu Wang, Alexandre Bayen, and Yi Wu.
+      The surprising effectiveness of ppo in cooperative multi-agent games. Advances in Neural
+      Information Processing Systems, 35:24611­24624, 2022.
+
+[43] Haifeng Zhang, Weizhe Chen, Zeren Huang, Minne Li, Yaodong Yang, Weinan Zhang, and Jun
+      Wang. Bi-level actor-critic for multi-agent coordination. In Proceedings of the AAAI Conference
+      on Artificial Intelligence, volume 34, pp. 7325­7332, 2020.
+
+[44] Tianhao Zhang, Yueheng Li, Chen Wang, Guangming Xie, and Zongqing Lu. Fop: Factorizing
+      optimal joint policy of maximum-entropy multi-agent reinforcement learning. In International
+      Conference on Machine Learning, pp. 12491­12500. PMLR, 2021.
+
+[45] Yifan Zhong, Jakub Grudzien Kuba, Siyi Hu, Jiaming Ji, and Yaodong Yang. Heterogeneous-
+      agent reinforcement learning, 2023.
+
+[46] Brian D Ziebart. Modeling purposeful adaptive behavior with the principle of maximum causal
+      entropy. Carnegie Mellon University, 2010.
+
+                                                          12
+Published as a conference paper at ICLR 2024
+
+Appendix
+
+Table of Contents
+
+A Preliminaries                                        14
+
+A.1 Table of Acronyms . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 14
+
+A.2 Individual-Global-Optimal . . . . . . . . . . . . . . . . . . . . . . . . . . . . 14
+
+A.3 Definitions and Assumptions . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+
+A.4 Proofs of Useful Lemmas . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+
+B Exact Calculation of Matrix Game                     18
+
+C Derivation of MaxEnt MARL Objective                  21
+
+D Proofs of Representation of QRE                      22
+
+E Proofs of Heterogeneous-Agent Soft Policy Iteration  24
+
+E.1 Proof of Joint Soft Policy Evaluation . . . . . . . . . . . . . . . . . . . . . . 24
+
+E.2 Proof of Joint Soft Policy Decomposition . . . . . . . . . . . . . . . . . . . . 24
+
+E.3 Proof of Heterogeneous-Agent Soft Policy Improvement . . . . . . . . . . . . 25
+
+E.4 Proof of Heterogeneous-Agent Soft Policy Iteration . . . . . . . . . . . . . . 26
+
+F Pseudocode of HASAC                                  27
+
+G Proofs of The Core Theorem of MEHAML                 28
+
+H Experimental Details                                 34
+
+H.1 Automatically Adjusting Temperature . . . . . . . . . . . . . . . . . . . . . . . 34
+
+H.2 Experimental Setup and Additional Results . . . . . . . . . . . . . . . . . . . . 34
+
+H.3 Hyper-parameter Settings for Experiments . . . . . . . . . . . . . . . . . . . . 37
+
+I Ablation Study on Sequential Updates                 42
+
+                                              13
+Published as a conference paper at ICLR 2024
+
+A PRELIMINARIES
+
+A.1 TABLE OF ACRONYMS
+Table 2 lists the main acronyms used in this paper.
+
+                 Table 2: The acronyms used in this paper.
+
+Acronym   Meaning
+A2PO      Agent-by-agent Policy Optimization
+CoPPO     Coordinated Proximal Policy Optimization
+CTDE      Centralized training decentralized execution
+FOP       Factorizing Optimal Joint Policy
+GRF       Google Research Football
+HA        Heterogeneous-Agent
+HADF      Heterogeneous-agent drift functional
+HAML      Heterogeneous-Agent Mirror Learning
+HAPPO     Heterogeneous-Agent Proximal Policy Optimization
+HARL      Heterogeneous-Agent Reinforcement Learning
+HASAC     Heterogeneous-Agent Soft Actor-Critic
+HASPI     Heterogeneous-agent soft policy iteration
+HATD3     Heterogeneous-Agent Twin Delayed Deep Deterministic Policy Gradient
+HATRPO    Heterogeneous-Agent Trust Region Policy Optimization
+IGO       Individual-Global-Optimal
+LAG       Light Aircraft Game
+MACPF     Multi-Agent Conditional Policy Factorization
+MADDPG    Multi-Agent Deep Deterministic Policy Gradient
+MAMuJoCo  Multi-Agent MuJoCo
+MAPG      Multi-agent policy gradient
+MAPPO     Multi-Agent Proximal Policy Optimization
+MARL      Multi-agent reinforcement learning
+MASQL     Multi-Agent Soft Q-Learning
+MaxEnt    Maximum entropy
+MEHAML    Maximum Entropy Heterogeneous-Agent Mirror Learning
+MEHAMO    Maximum Entropy Heterogeneous-Agent Mirror Operator
+MEHARL    Maximum Entropy Heterogeneous-Agent Reinforcement Learning
+MPE       Multi-Agent Particle Environment
+NE        Nash equilibrium
+PGM       Probabilistic Graphical Model
+PPO       Proximal Policy Optimization
+QRE       Quantal response equilibrium
+RL        Reinforcement learning
+RPS       Run pass and shoot with keeper
+SAC       Soft Actor-Critic
+SMAC      StarCraft Multi-Agent Challenge
+SQL       Soft Q-Learning
+
+A.2 INDIVIDUAL-GLOBAL-OPTIMAL
+
+The Individual-Global-Optimal (IGO) assumption is introduced in (44) and can be stated as below.
+Definition 3 (IGO). For an optimal joint policy (a|s) : S × A  [0, 1], if there exist individual
+optimal policies [i (ai|s) : S × Ai  [0, 1]]in=1, such that the following holds:
+
+                                                                                      n
+
+                                             (a|s) = i (ai|s),
+
+                                                                                    i=1
+
+then, we say that [i] satisfy IGO for  under s.
+
+                                                          14
+Published as a conference paper at ICLR 2024
+
+The main limitation of IGO arises from the fact that during training, each agent's policy is updated
+based solely on its local Q-function, thereby ignoring the actions of other agents. As discussed by
+Wang et al. (32), when multiple agents need to collaborate in decision-making, they may fail to
+reach a consensus, updating their policies in the direction that increases their local Q-functions, but
+eventually resulting in a decrease in the global Q-function.
+
+A.3 DEFINITIONS AND ASSUMPTIONS
+
+Throughout the proofs, we make the following regularity assumption introduced by Kuba et al. (13):
+
+Assumption 1. There exists   R, such that 0 <   1, and for every agent i  N , the policy
+space i is -soft; that means that for every i  i, s  S, and ai  Ai, we have i ai|s  .
+
+In the following, we provide the essential definitions of the two key components, originally proposed
+by Kuba et al. (15), that serve as the building blocks of the MEHAML framework. Additionally, we
+present the definitions of soft advantage function and a notion of distance that will be utilized in the
+proof of Lemma A.2.
+Definition 4. Let i  N , a heterogeneous-agent drift functional (HADF) Di of i consists of a map,
+which is defined as
+
+                    Di :  ×  × P(-i) × S  Di ·|s, ¯ j1:m : P Ai  R ,
+
+such that for all arguments, under notation Di ^i|s, ¯ j1:m  Di ^i ·i|s |s, ¯ j1:m ,
+
+             1. Di ^i|s, ¯ j1:m  Di i|s, ¯ j1:m = 0 (non-negativity),
+             2. Di ^i|s, ¯ j1:m has all Gâteaux derivatives zero at ^i = i (zero gradient),
+
+We say that the HADF is positive if Di ^i|¯ j1:m = 0, s  S implies ^i = i, and trivial if
+Di ^i|¯ j1:m = 0, s  S for all , ¯ j1:m , and ^i.
+
+Definition 5. Let i  N . We say that, U i : ×i  P i is a neighborhood operator if i  i,
+
+Ui i contains a closed ball, i.e., there exists a state-wise monotonically non-decreasing metric
+ : i ×i  R such that i  i there exists i > 0 such that  i, ¯i  i = ¯i  Ui i .
+
+Definition 6. Let i1:m = {i1, . . . , im}  N and j1:k = {j1, . . . , jk}  N be disjoint ordered
+
+subsets  of  agents,  and  let  Qi1:m  s, ai1:m    be the multi-agent soft Q-function. Then the multi-agent
+
+                                   
+
+soft advantage function is defined as
+
+             Ai1:m     s, aj1:k , ai1:m   Qj1:k,i1:m       s, aj1:k , ai1:m  -  Qj1:k  s, aj1:k  .             (11)
+
+                                                                                   
+
+Definition 7. Let X be a finite set and p : X  R, q : X  R be two maps. Then, the notion of
+distance between p and q that we adopt is given by p - q  maxxX |p(x) - q(x)|.
+
+A.4 PROOFS OF USEFUL LEMMAS
+
+Lemma A.1 (Multi-Agent Advantage Decomposition). Let  be a joint policy, and i1, . . . , im be an
+arbitrary ordered subset of agents. Then, for any state s and joint action ai1:m ,
+
+                                                      m
+
+                                Ai1:m    s, ai1:m  =       Aij s, ai1:j-1 , aij .                              (12)
+                                   
+
+                                                      j=1
+
+Proof. (The lemma is proposed in (12) and we quote the proof from Kuba et al. (12)) By the definition
+of multi-agent soft advantage function,
+
+Ai1:m        s, ai1:m  =   Qi1:m  s, ai1:m  - V(s)
+
+                              
+
+                           m                                                    m
+
+                       =        Qi1:j    s, ai1:j  - Qi1:j-1  s, ai1:j-1     =         Aij s, ai1:j-1 , aij ,
+
+                                                          
+
+                           j=1                                                  j=1
+
+which finishes the proof.
+
+                                                      15
+Published as a conference paper at ICLR 2024
+
+The continuity of Q is a crucial requirement for proving Theorem 3 later. Now we first prove
+that the inclusion of an additional entropy term does not affect the continuity of Q, which is the
+state-action value function in the single-agent setting, where  denotes the policy of a single agent.
+And finally, we generalize the result to Q in MARL.
+
+Lemma A.2 (Continuity of Q). Let  be a policy. Then Q(s, a) is continuous in .
+
+Proof. Let  and ^ be two policies. Then we have
+|Q(s, a) - Q^ (s, a)|
+
+= r(s, a) +  P (s|s, a)     (a|s)Q(s, a) -   (a|s) log  (a|s)
+
+   s                     a                        a
+
+- r(s, a) +  P (s|s, a)     ^(a|s)Q^ (s, a) -  ^ (a|s) log ^ (a|s)
+
+   s                     a                        a
+
+=  P (s|s, a)     [(a|s)Q(s, a) - ^(a|s)Q^ (s, a)]
+
+s              a
+
+- [ (a|s) log  (a|s) - ^ (a|s) log ^ (a|s)]
+
+       a
+
+  P (s|s, a)      |(a|s)Q(s, a) - ^(a|s)Q^ (s, a)|
+
+s              a
+
++ | (a|s) log  (a|s) - ^ (a|s) log ^ (a|s)|
+
+       a
+
+=  P (s|s, a)     |(a|s)Q(s, a) - ^(a|s)Q(s, a)
+
+s              a
+
++ ^(a|s)Q(s, a) - ^(a|s)Q^ (s, a)|
+
++  |( (a|s) - ^ (a|s)) log  (a|s) + ^ (a|s) (log  (a|s) - log ^ (a|s))|
+
+         a
+
+  P (s|s, a)      (|(a|s)Q(s, a) - ^(a|s)Q(s, a)|
+
+s              a
+
++ |^(a|s)Q(s, a) - ^(a|s)Q^ (s, a)|)
+
++  (| (a|s) - ^ (a|s)| |log  (a|s)| + |^ (a|s)| |log  (a|s) - log ^ (a|s)|)
+
+         a
+
+=  P (s|s, a)     |(a|s) - ^(a|s)| · |Q(s, a)| + ^(a|s) |Q(s, a) - Q^ (s, a)|
+
+s              a                                     a
+
++  (| (a|s) - ^ (a|s)| |log  (a|s)| + |^ (a|s)| |log  (a|s) - log ^ (a|s)|)
+
+         a
+
+  P (s|s, a)       - ^ · Qmax + ^(a|s) Q - Q^ 
+
+s              a                      a
+
++  ( - ^ · logmax  + ^ (a|s)  log  - log ^)
+
+          a
+
+ Qmax · |A| ·  - ^ +  Q - Q^  +  logmax  · |A| ·  - ^ +  log  - log ^
+Hence, we get
+
+Q - Q^   Qmax·|A|·-^+ Q - Q^ + logmax ·|A|·-^+ log -log ^,
+
+                                              16
+Published as a conference paper at ICLR 2024
+
+which implies
+
+          Q    -   Q^          ·  |A|  ·  (Qmax  +   logmax  ) ·   -    ^     +   log     -  log ^
+                                                              1-
+
+By continuity of  and log , for any arbitrary  > 0, we can find 1 > 0 such that  - ^ < 1
+
+implies    - ^     <                (1-)            and  2   >  0 such  that      - ^  <  2  implies   log   -
+                      2·|A|·(Qmax+ logmax )
+
+log ^  <  (1-)  .    Taking       =  min (1, 2)     ,  when   - ^       <     we  get  Q - Q^   <     ,  which
+            2
+
+finishes the proof.
+
+Corollary 1. From Lemma A.2 we obtain that the following functions are continuous in  :
+
+             (1) the state value function V(s) = a ((a|s)Q(s, a) - (a|s) log (a|s)),
+
+             (2) the advantage function A(s, a) = Q(s, a) - V(s),
+
+             (3) and the expected total reward J() = Es0 [V(s)].
+Corollary 2 (Continuity in MARL). All the results about continuity in  extend to MARL. Policy 
+can be replaced with joint policy ; as  is Lipschitz-continuous in agent i 's policy i, the above
+continuity results extend to continuity in i. Thus, we will quote them in our proofs for MARL.
+
+                                                       17
+Published as a conference paper at ICLR 2024
+
+B EXACT CALCULATION OF MATRIX GAME
+
+In this section, we provide an exact calculation of the matrix game in Section 3.2. The initial policies
+of the matrix game represent the scenario where due to the exploration and learning in the early
+stages, agents may have explored a locally optimal solution (in this example action (A, A)) and
+assigned a high probability to it. The matrix game aims to show that both MAPPO and HAPPO will
+converge towards this local optimum in expectation, while HASAC, owing to its optimization of the
+maximum entropy objective, has the potential to escape this local optimum and converge towards a
+superior solution.
+
+We start by analyzing MAPPO. For both parameter-sharing and non-parameter-sharing versions of
+MAPPO, the policy is optimizing the following objective:
+
+                   niew  =  arg max     Esold ,aold            i(ai|s)                                        (13)
+                                                               oild(ai|s) Aold (s, a) , i = 1, 2
+                                 i
+
+Note that we omit ratio-clipping in this tabular case, as this is simpler and does not affect the final
+
+result. In this 2-agent single-state matrix game, s  old can be ignored as there is only one state.
+Value function Vold (s) can be calculated exactly:
+
+      Vold (s) = Eaold [Qold (s, a)]      Agent 2
+                = Eaold [r(s, a)]
+                = 0.36 × 5 + 0.04 × 10 + 0.04 × 20 + 4 × 0.12 × (-20) + 2 × 0.04 × (-20)
+                = -8.2
+
+Similarly, the advantage function Aold (s, a) can be calculated exactly as shown in Figure 6.
+
+                                                                     Agent 1
+                                                                 ABC
+                                                          A 13.2 -11.8 -11.8
+                                                          B -11.8 18.2 -11.8
+                                                          C -11.8 -11.8 28.2
+
+                  Figure 6: Advantage values Aold (s, a) for all joint actions in the first iteration.
+
+Expanding objective 13, we get
+
+      niew  =  arg max  (0.36  ×  13.2  +  0.12    ×  (-11.8)  ×      2)  ×  i(ai =     A|s)
+                                                                                   0.6
+                    i
+
+                                                                                              i(ai = B|s)
+                         + (0.12 × (-11.8) + 0.04 × 18.2 + 0.04 × (-11.8)) ×
+
+                                                                                                     0.2
+
+                                                                                                 i(ai = C|s)
+                         + (0.12 × (-11.8) + 0.04 × (-11.8) + 0.04 × (28.2)) ×
+
+                                                                                                       0.2
+
+            = arg max 3.2 × i(ai = A|s) + (-5.8) × i(ai = B|s) + (-3.8) × i(ai = C|s)
+
+                i
+
+This will encourage i to assign a higher probability to action A and lower probabilities to action
+
+B and C. The updated policies will further encourage choosing action A in subsequent iterations.
+Finally, the policies will converge to the deterministic policies i = (1, 0, 0), i = 1, 2.
+
+For HAPPO, the agents update their policies sequentially. Without loss of generality, we assume
+
+they update in the order of Agent 1 and Agent 2. Agent 1 updates its policy according to objective
+
+13 and increases the probability of action A. Let n1ew = (p1, p2, p3), s.t. p1 > 0.6, p2 < 0.2, p3 <
+      3
+0.2,  j=1   pj  =  1.  Agent  2  updates  its      policy  according  to  the  following  objective:
+
+                                                           18
+Published as a conference paper at ICLR 2024
+
+n2ew  =  arg max  Esold ,aold   2(a2|s)     n1ew(a1|s)  Aold  (s,  a)
+                                o2ld(a2|s)  o1ld(a1|s)
+              2
+
+      = arg max (0.6 × p1 × 13.2 + 0.6 × p2 × (-11.8) + 0.6 × p3 × (-11.8)) ×      2(a2 = A|s)
+
+                2                                                                    0.6
+
+                  + (0.2 × p1 × (-11.8) + 0.2 × p2 × 18.2 + 0.2 × p3 × (-11.8)) ×  2(a2 = B|s)
+
+                                                                                     0.2
+
+                  + (0.2 × p1 × (-11.8) + 0.2 × p2 × (-11.8) + 0.2 × p3 × (28.2)) ×  2(a2 = C|s)
+
+                                                                                          0.2
+
+      = arg max (13.2 × p1 - 11.8 × p2 - 11.8 × p3) × 2(a2 = A|s)
+
+                2
+
+                  (-11.8 × p1 + 18.2 × p2 - 11.8 × p3) × 2(a2 = B|s)
+
+                  (-11.8 × p1 - 11.8 × p2 + 28.2 × p3) × 2(a2 = C|s)
+
+Since (13.2 × p1 - 11.8 × p2 - 11.8 × p3) > 3.2, (-11.8 × p1 + 18.2 × p2 - 11.8 × p3) <
+-5.8, (-11.8 × p1 - 11.8 × p2 + 28.2 × p3) < -3.8, this will encourage assigning higher probability
+to action A and lower probability to action B and C. Similar to MAPPO, the updated policies
+will further encourage choosing action A in subsequent iterations. Finally, the policies converge to
+i = (1, 0, 0), i = 1, 2.
+
+By contrast, HASAC is possible to escape the local optimum and converge to better stochastic
+policies, as we show below. Without loss of generality, we assume the update order is Agent 1 and
+Agent 2. We first consider the update of Agent 1, who optimizes the following objective:
+
+         n1ew       =  arg max  Ea1  1 ,a2 o2ld  Qold (s, a1, a2) -  log 1(a1|s)
+
+                            1
+
+                    =  arg max  Ea1  1 ,a2 o2ld  r(s, a1, a2) -  log 1(a1|s)
+
+                            1
+
+Parametrizing 1 = (p1, p2, p3), we get
+
+         n1ew = arg max - 5p1 - 14p2 - 12p3 - p1 log p1 - p2 log p2 - p3 log p3,
+
+                           1
+
+                             s.t. p1 + p2 + p3 = 1
+
+The solutions corresponding to different  are listed in the left part of Table 3.
+
+                       After the first update           Convergent (both)
+
+                       p1       p2          p3          p1             p2  p3
+
+                  1 0.9990 0.0001 0.0009 1.0000 0.0000 0.0000
+
+                  2 0.9603 0.0107 0.0290 1.0000 0.0000 0.0000
+
+                  5 0.7083 0.1171 0.1747 0.9849 0.0075 0.0076
+
+                  10 0.5254 0.2136 0.2609 0.0221 0.0224 0.9555
+
+                  15 0.4596 0.2522 0.2882 0.1278 0.1354 0.7368
+
+                  20 0.4269 0.2722 0.3009 0.2514 0.2790 0.4697
+
+Table 3: Exact calculation results for HASAC update. On the left we show the policy after the first update; on
+the right we show the policies of 1 and 2 after convergence.
+
+As  increases, the policy is encouraged to be stochastic, trading off between stochasticity and reward
+maximization. With appropriate , the policies will be able to assign higher probabilities to action B
+
+                                                 19
+Published as a conference paper at ICLR 2024
+and C, thereby retaining the exploration of them. It then encourages more exploration of action B
+and C in subsequent updates. Finally, the convergent policies predominantly choose action C while
+still being stochastic, as shown in the right part of Table 3.
+Thus, we show the benefit of stochastic policies and that in expectation, with appropriate , HASAC
+is capable of escaping local optimum and converging to better stochastic policies. We note that
+the exact calculation results are generally consistent with the empirical results in Section 5.2 (this
+can be easily checked by computing the joint action probabilities and comparing with Table 5). An
+observation is that when  = 5, theoretically it is not sufficient for escaping local optimum but
+empirically it already results in learning the optimal actions (C, C). This may be due to the fact that
+in practical implementation, HASAC learns a centralized Q-function by sampling from the replay
+buffer, which introduces some randomness that causes slight deviations between the experimental
+results and the exact calculated ones.
+
+                                                          20
+Published as a conference paper at ICLR 2024
+
+C DERIVATION OF MAXENT MARL OBJECTIVE
+
+In this section, we derive the maximum entropy objective of MARL (Equation 2) by performing
+variational inference in Figure 2. In structured variational inference, our objective is to approximate
+some distribution p(y) with another, usually simpler distribution q(y). In our case, we aim to
+approximate p( ), given by
+
+                             T                                           T
+
+                         p( ) = p(s1) p(st+1|st, at) exp                          r(st, at) ,             (14)
+
+                             t=1                                         t=1
+
+via the distribution
+
+                      T                                       T                          n
+
+q( ) = q(s1) q(st+1|st, at)q(at|st) = q(s1) q(st+1|st, at) qim atim |st ,                                 (15)
+
+                      t=1                                     t=1                        m=1
+
+where the joint policy q(at|st) follows a fully independent factorization q(at|st) =
+n
+m=1  qim  aitm |st    as we assume that agents are independent of each other under CTDE paradigm.
+
+To avoid risk-seeking behavior, we fix the environment dynamics, i.e., q(s1) = p(s1) and
+
+q(st+1|st, at) = p(st+1|st, at). In structured variational inference, approximate inference is per-
+
+formed by optimizing the variational lower bound (also called the evidence lower bound). In our case,
+
+the evidence is that Ot = 1, t  {1, . . . , T } and the posterior is conditioned on the initial state s1.
+
+The variational lower bound is given by
+
+     log p(O1:T ) = log      p(O1:T , s1:T , a1:T )ds1:T da1:T
+
+                      = log  p(O1:T      ,  s1:T  ,  a1:T  )  q(s1:T  ,  a1:T  )  ds1:T  da1:T
+                                                              q(s1:T  ,  a1:T  )
+
+                      = log E(s1:T ,a1:T )q(s1:T ,a1:T )      p(O1:T , s1:T , a1:T )
+                                                                 q(s1:T , a1:T )
+
+                       E(s1:T ,a1:T )q(s1:T ,a1:T ) [log p(O1:T , s1:T , a1:T ) - log q(s1:T , a1:T )] ,
+
+where the inequality on the last line is obtained via Jensen's inequality. Substituting the definitions of
+p( ) and q( ) from Equations 14 and 15, and according to q(st+1|st, at) = p(st+1|st, at), the bound
+reduces to
+
+                                                     T                            n
+
+log p (O1:T )  E(s1:T ,a1:T )q(s1:T ,a1:T )                   r (st, at) -           log qim atim |st  ,  (16)
+
+                                                     t=1                       m=1
+
+Optimizing this lower bound with respect to the policy q(at|st) corresponds exactly to the following
+maximum entropy objective:
+
+                                            T                                  n
+
+          J () = Es1:T 1:T ,a1:T                        r (st, at) +  H i (·|st) ,                        (2)
+
+                                            t=1                          i=1
+
+where we multiply a temperature parameter  to the entropy term to assign relative importance to
+entropy and reward maximization (9).
+
+                                                     21
+Published as a conference paper at ICLR 2024
+
+D PROOFS OF REPRESENTATION OF QRE
+
+Theorem 1 (Representation of QRE). A joint policy QRE   is a QRE if none of the agents can
+increase the maximum entropy objective (Equation 2) by unilaterally altering its policy, i.e.,
+
+                                    i  N , i  i, J i, Q-RiE  J QRE .
+
+Then the QRE policies are given by
+
+                   i  N , Qi RE ai|s :=           exp   E -1                                    QQRE  s, ai, a-i
+                                                                  a-i Q-RiE
+                                                                                                                           ,      (3)
+
+                                                  biAi exp  E -1 a-iQ-RiE QQRE (s, bi, a-i)
+
+where the soft Q-functions are defined as follows,
+
+Q(s, a) = r (s, a) + Ea1:,s1:P                                                                               n          s0 = s, a0 = a .
+                                                                                                                                             (4)
+                                                      t                          r (st, at) +  H i (·|st)
+
+                                                  t=1                                                      i=1
+
+Proof. First, we consider the following constrained policy optimization problem to agent i: for a
+given state s  S,
+
+                                                                                     n
+
+                   max Eaii,a-i-i [Q(s, a)] -                                                   j aj|s log j aj|s ,
+                   i
+                                                                                     j=1 aj Aj
+
+                                         s.t.          i ai|s = 1.
+
+                                                ai Ai
+
+We consider its associated Lagrangian function as follows,
+
+                                                                              n         j aj|s log j aj|s + (                     i ai|s - 1)
+
+L(i, ) = Eaii,a-i-i [Q(s, a)] - 
+
+                                                  j=1 aj Aj                                                                ai Ai
+
+                      n                                n
+
+       =                  j aj|s Q(s, a) -                                              j aj|s log j aj|s + (                     i ai|s - 1).
+
+          aA j=1                                       j=1 aj Aj                                                           ai Ai
+
+Then we consider the derivative of L(i, ) with respect to i, we obtain
+
+       L(i, )                              j aj|s Q(s, ai, a-i) -  log i ai|s -  + .
+       i (ai|s) =
+                              a-iA-i j= i
+
+Let     L( i ,)    =  0,  we  know  the  optimal  policy                         i  satisfies  the  following  condition,
+        i (ai |s)
+
+                      i ai|s = exp(-1Ea-i-i Q s, ai, a-i                                                     
+                                                                                                      ) exp( - 1).
+
+                                                                                                             
+
+Furthermore, since aiAi i ai|s = 1, we know optimal lagrange multiplier  satisfies
+
+                          exp(1 -  ) =            exp(-1Ea-i-i Q s, ai, a-i ),
+                                     
+                                         ai Ai
+
+i.e.,
+
+                       = 1 - log                exp(-1Ea-i-i Q s, ai, a-i ) .
+
+                                         ai Ai
+
+Finally, we obtain the optimal policy as follows,
+
+                          i ai|s =        exp(-1Ea-i-i Q                                         s, ai, a-i    )     .
+                                         biAi exp(-1Ea-i-i                                      [Q (s, bi,   a-i)])
+
+                                                                                 22
+Published as a conference paper at ICLR 2024
+
+Hence, when each agent can not increase the maximum entropy objective by unilaterally changing its
+policy, policies take the following form,
+
+                                                                      n
+
+i  N , Qi RE  ai|s  =  arg max     Eai  i ,a-i Q-RiE  QQRE (s, a)  -             j  aj |s  log j  aj |s
+
+                          i (·|s)                                     j=1 aj Aj
+
+                    = i ai|s =     exp(-1Ea-iQ-RiE QQRE s, ai, a-i )                ,
+
+                                   biAi exp(-1Ea-iQ-RiE QQRE (s, bi, a-i) )
+
+which finishes the proof.
+
+                                              23
+Published as a conference paper at ICLR 2024
+
+E PROOFS OF HETEROGENEOUS-AGENT SOFT POLICY ITERATION
+
+In this section, we introduce heterogeneous-agent soft policy iteration and prove its properties of
+monotonic improvement and convergence to the QRE policies.
+
+E.1 PROOF OF JOINT SOFT POLICY EVALUATION
+
+For joint soft policy evaluation, we will repeatedly apply soft Bellman operator  to Q(s, a) until
+
+convergence, where:
+
+                                       Q(s, a)  r(s, a) + EsP [V (s)]                                                                   (17)
+
+                                                                          n
+
+                            V (s) = Ea Q(s, a) +  H i ·i|s .                                                                            (18)
+
+                                                                          i=1
+
+In this way, as shown in lemma 4.1, we can get Q for any joint policy .
+
+Lemma 4.1 (Joint Soft Policy Evaluation). Consider the soft Bellman backup operator  and a
+mapping Q0 : S × A  R with |A| < , and define Qk+1 = Qk. Then the sequence Qk will
+converge to the joint soft Q-function  as k  .
+
+Proof. We define the reward with entropy term as r(s, a)  r(s, a)+EsP                                            n        H      i  ·i|s        .
+We can then express the update rule as:                                                                          i=1
+
+                               Q(s, a)  r(s, a) + EsP,a [Q(s, a)]
+
+and apply the standard convergence results for policy evaluation (28).
+
+E.2 PROOF OF JOINT SOFT POLICY DECOMPOSITION
+
+After we get Q(s, a), we draw a permutation i1:n  Sym(n) and update each agent's policy im
+according to the following optimization proposition:
+
+Proposition 1 (Joint Soft Policy Decomposition). Let  be a joint policy, and i1:n  Sym(n) be an
+agent permutation. Suppose that, for each state s and every m = 1, . . . , n,
+
+                                                                                             1  i1:m         i1:m-1 im                  
+nim ew = arg min DKL im                                                                         old                                      , (8)
+                                              ·im |s   exp     E Q s, a , · ai1:m-1 nie1w:m-1
+                     im im                            
+                                                                   Eai1:m-1 nie1w:m-1 [Zold (s, ai1:m-1 )]
+
+where   ai1:m-1  is  drawn  from         the  policy  i1:m-1       (·|s)  and     the   partition    function       Zold            s, ai1:m-1
+
+                                                        new
+
+normalizes the distribution. Then the joint policy satisfies the following:
+
+                            new = arg min DKL                            exp      Q 1        (s, ·)    .                                  (9)
+                                                                (·|s) 
+                                                                                   old
+
+                                                                               Zold (s)
+
+Proof.  First,  we   use  Lim       (im  (·|s))  to   denote
+
+                            oilm d
+
+                                                                               1     i1:m         i1:m-1 im               
+        DKL im                                                                       old                                  .
+                            ·im |s        exp    E Q s, a , · ai1:m-1 nie1w:m-1
+                                         
+                                                                                                i1:m-1
+                                                      E [Z (s, a )] ai1:m-1 nie1w:m-1
+                                                                                     old
+
+Suppose that there exists a policy ¯ = new, such that Lold (¯ (·|s)) < Lold (new(·|s)), we have
+
+                                    n                                                                  n
+
+Ea¯ [Qold (s, a)] +  H ¯i ·i|s > Eanew [Qold (s, a)] +  H niew ·i|s . (19)
+
+                                    i=1                                                              i=1
+
+From  Equation   8,  we   have      Lim       (nim ew(·|s))    Lim       (¯im  (·|s))   for  every   m    =  1,  .  .  .  ,  n,  i.e.,
+
+                                      oilm d                     oilm d
+
+        Eai1:m-1 nie1w:m-1 ,aim niemw                 Qi1:m   (s,  ai1:m-1  ,  aim   )  -    log  nim ew  aim |s
+
+                                                         old
+
+         Eai1:m-1 nie1w:m-1 ,aim ¯im                  Qi1:m        (s,   ai1:m-1  ,  aim  )  -    log  ¯im   aim |s              .
+
+                                                         old
+
+                                                                   24
+Published as a conference paper at ICLR 2024
+
+                                                                              Q (s, a ) i1:m-1
+
+                                                                                 old
+Subtracting both sides of the inequality by Eai1:m-1 nie1w:m-1                                   i1:m-1  gives
+
+Eai1:m-1 nie1w:m-1 ,aim niemw        Aim          (s,  ai1:m-1  ,  aim  )  -       log   nim ew  aim |s
+
+                                        old                                                                        (20)
+
+ Eai1:m-1 nie1w:m-1 ,aim ¯im                  Aim      (s,  ai1:m-1  ,  aim   )  -      log   ¯im   aim |s  .
+
+                                                 old
+
+Combining this with Lemma A.1 gives
+
+Eanew                                   n
+
+        n  Aold (s, a) +  H niew ·i|s
+
+=                                      i=1
+
+     m=1                                          im            i1:m-1 im                           im   aim |s
+                                                  old                                               new
+           E A (s, a , a ) -  log  ai1:m-1 nie1w:m-1 ,aim niemw
+
+by Inequality 20
+
+       n   Eai1:m-1 nie1w:m-1 ,aim ¯im            Aim      (s,  ai1:m-1    ,  aim  )  -    log   ¯im     aim |s
+
+                                                     old
+
+    m=1
+
+                                               n
+
+= Ea¯ Aold (s, a) +  H ¯i ·i|s .
+
+                                              i=1
+
+The resulting inequality can be equivalently rewritten as
+
+                                           n                                                          n
+
+Ea¯ [Qold (s, a)] +  H ¯i ·i|s                     Eanew [Qold (s, a)] +  H niew ·i|s , (21)
+
+                                         i=1                                                        i=1
+
+which contradicts Equation 19. Hence, for all   , Lold (new(·|s))  Lold ((·|s)), i.e.,
+
+           new = arg min DKL                                exp         Q 1           (s, ·)     ,
+                                                   (·|s) 
+                                                                         old
+
+                                                                        Zold (s)
+
+which finishes the proof.
+
+E.3 PROOF OF HETEROGENEOUS-AGENT SOFT POLICY IMPROVEMENT
+
+Then the soft Q-function and joint maximum entropy objective (Equation 2) has monotonic improve-
+ment property as formalized below.
+
+Lemma 4.2 (Heterogeneous-Agent Soft Policy Improvement). Let i1:n  Sym(n) be an agent
+permutation, and for every m = 1, . . . , n, let policy oim ld  im and nim ew be the optimizer of the
+minimization problem defined in Equation 8. Then Qnew (s, a)  Qold (s, a) for all (s, a)  S × A
+with |A| <  and J (new)  J (old).
+
+Proof. From Proposition 1, we have
+
+new = arg min DKL                    exp               Q 1      (s, ·)        =    arg   min     Lold    ((·|s)).
+                            (·|s) 
+                                                        old                              
+
+                                                  Zold (s)
+
+It must be the case that Lold (new(·|s))  Lold (old(·|s)). Hence
+
+                                               n                                                     n             = Vold (s).
+                                                                                                                    (22)
+Eanew [Qold (s, a)] +  H niew ·i|s                 Eaold [Qold (s, a)] +  H oild ·i|s
+
+                                             i=1                                                   i=1
+
+                                                       25
+Published as a conference paper at ICLR 2024
+
+Last, considering the soft Bellman equation, the following holds:                                              ) (by Inequality 22)
+Qold (s, a) = r(s, a) + EsP [Vold (s)]
+
+                                                                                                            n
+
+               r(s, a) + EsP Eanew [Qold (s, a)] +  H niew ·i|s
+
+                                                                                                          i=1
+
+             ...
+
+               Qnew (s, a),
+                                                                                                                   (23)
+
+where we have repeatedly expanded Qold on the RHS by applying the soft Bellman equation and the
+bound in Inequality 22. Convergence to Qnew follows from Lemma 4.1.
+
+We use it to prove the claim as follows,              n
+
+Vnew (s) = Eanew [Qnew (s, a)] +  H niew ·i|s
+
+                                                  i=1
+
+                                                                          n
+
+                       Eanew [Qold (s, a)] +  H niew ·i|s (by Inequality 23)
+
+                                                  i=1
+
+                                                                         n
+
+                       Eaold [Qold (s, a)] +  H oild ·i|s (by Inequality 22)
+
+                                                  i=1
+
+                      = Vold (s).
+
+Subsequently, the monotonic improvement property of the joint maximum entropy return follows
+naturally, as
+
+                      J (new ) = Esd [Vnew (s)]  Esd [Vold (s)] = J (old ) .
+
+E.4 PROOF OF HETEROGENEOUS-AGENT SOFT POLICY ITERATION
+
+The full heterogeneous-agent soft policy iteration algorithm alternates between the joint soft policy
+
+evaluation and the heterogeneous-agent soft policy improvement steps, and it will provably converge
+
+to the QRE policies.
+
+Theorem 2 (Heterogeneous-Agent Soft Policy Iteration). For any joint policy   , if we
+
+repeatedly apply joint soft policy evaluation and heterogeneous-agent soft policy improvement from
+                                   n
+i  i. Then the joint policy  =     i=1    i  converges   to  QRE  in  Theorem  1.
+
+Proof. Let k be the joint policy at iteration k.
+
+First, by Lemma 4.2, we have that Qk (s, a)  Qk+1 (s, a), and that the soft Q-function is upper-
+bounded by Qmax for all    (both reward and entropy are bounded). Hence, the sequence
+
+converges to some limit point ¯ .
+
+Then, considering this limit point joint policy ¯ , it must be the case that
+
+                      i  N , i  i, Li¯i (¯i(·|s))  Li¯i (i(·|s)).
+
+And we have  ¯i ·i|s = arg max Eaii Qi¯ s, ai -  log i ai|s
+
+                                 i (·i |s)P (Ai )
+
+                      = arg max Eaii,a-i¯ -i [Q¯ (s, a)]                                                       (24)
+
+                          i (·i |s)P (Ai )
+
+                               n          j aj|s log j aj|s , i  N .
+
+                      -
+
+                      j=1 aj Aj
+
+Last, following the proof of Theorem 1, we have
+
+             ¯i ai|s :=             exp   -1Ea-i¯ -i Q¯       s, ai, a-i      a-i)]) .
+                                          exp (-1Ea-i¯ -i    [Q¯ (s, bi,
+                                   bi Ai
+
+Thus, ¯ is a quantal response equilibrium, which finishes the proof.
+
+                                                  26
+Published as a conference paper at ICLR 2024
+
+F PSEUDOCODE OF HASAC
+
+Algorithm 2: Heterogeneous-Agent Soft Actor-Critic
+
+Input: temperature , Polyak coefficient  , batch size B, number of: agents n, episodes K,
+
+         steps per episode T , mini-epochs e;
+Initialize: the critic networks: 1 and 2 and policy networks: i iN , replay buffer B, Set
+ target parameters equal to main parameters targ, 1  1, targ, 2  2;
+for k = 0, 1, . . . , K - 1 do
+
+    Observe state oti and select action ait  i (·|oti);
+    Execute ait in the environment;
+    Observe next state ot+1, reward rt;
+    Push transitions oti, ait, oti+1, rt , i  N , t  T into B;
+    Sample a random minibatch of B transitions from B;
+
+    Compute the critic targets
+
+                                                     n
+
+yt = r+    min    Qtarg  ,i  (st+1,  at+1)   -           log i ait+1|oit+1  , at+1   (·|st+1) ;
+
+           i=1,2                                    i=1
+
+Update Q-functions by one step of gradient descent using
+
+                i  =  arg       min  1       (yt - Qi (st, at))2   for i = 1, 2;
+
+                                 i   B  t
+
+Draw a permutation of agents i1:n at random;
+
+for agent im = i1, . . . , in do
+    Update agent im by solving
+
+nim ew  =  arg  max   1         min     Qi      s , ai1:m-1t       o , a o , a i1:m-1imimim+1:n      oim+1:n
+                      B                                                                 oilm d +1:n
+                 ^im            i=1,2                                t                                 t
+                                                        nie1w:m-1           ^im t
+
+                             t
+
+                                -       log  im      aim    |oitm
+
+                                               ^im     ^im
+
+         where ai(oti) is a sample from i (·|oit) which is differentiable wrt  via the
+         reparametrization trick;
+         with e mini-epochs of policy gradient ascent;
+    end
+    Update the target critic network smoothly
+
+                                 targ ,i  targ ,i + (1 - )i for i = 1, 2;
+
+end
+Discard  . Deploy i iN in execution;
+
+                                                     27
+Published as a conference paper at ICLR 2024
+
+G PROOFS OF THE CORE THEOREM OF MEHAML
+
+First, we show that enhancing the MEHAMO (Definition 2) alone is sufficient to guarantee policy
+improvement, as demonstrated by the following lemma.
+
+Lemma G.1. Let old and new be joint policies and let i1:n  Sym(n) be an agent permutation.
+Suppose that, for every state s  S and every m = 1, . . . , n,
+
+                    M V (niemw )            old       (s)       M V (oilm d )             old  (s)                     (25)
+                         Dim ,nie1w:m-1                              Dim ,nie1w:m-1
+
+Then, new is jointly better than old , so that for every state s,
+
+                                                     Vnew (s)  Vold (s).
+Subsequently, the monotonic improvement property of the joint return follows naturally, as
+
+                    J (new ) = Esd [Vnew (s)]  Esd [Vold (s)] = J (old ) .
+
+Proof. By Inequality 25, we have
+
+Eai1:m-1 nie1w:m-1 ,aim niemw               Qi1:m     (s,  ai1:m-1  ,  aim  )     -    log   nim ew  aim |s
+
+                                               old
+
+-  Dim              nim ew  |s,  i1:m-1
+
+      old                          new
+
+ Eai1:m-1 nie1w:m-1 ,aim oilm d                  Qi1:m     (s,  ai1:m-1  ,  aim   )  -       log  oim ld  aim |s
+
+                                                    old
+
+-  Dim              oim ld  |s,  i1:m-1  .
+
+      old                          new
+
+                                                                               Q (s, a ) i1:m-1
+
+                                                                                  old
+Subtracting both sides of the inequality by Eai1:m-1 nie1w:m-1                                       i1:m-1    gives
+
+Eai1:m-1 nie1w:m-1 ,aim niemw               Aim       (s,  ai1:m-1  ,  aim  )  -       log   nim ew  aim |s
+
+                                               old
+
+-  Dim              nim ew  |s,  i1:m-1
+
+      old                          new
+
+ Eai1:m-1 nie1w:m-1 ,aim oilm d                  Aim       (s,  ai1:m-1  ,  aim   )  -      log   oim ld  aim |s       (26)
+
+                                                    old
+
+-  Dim              oim ld  |s,  i1:m-1  .
+
+      old                          new
+
+Let Dold (new |s)   D n          im      nim ew  |s,  i1:m-1        . Combining this with Lemma A.1 gives
+                    m=1 old
+                                                        new
+
+Eanew                                   n                           - Dold (new |s)
+
+        n  Aold (s, a) +  H niew ·i|s
+
+=                                      i=1
+
+     m=1                                              im            i1:m-1 im                             im   aim |s
+                                                      old                                                 new
+           E A (s, a , a ) -  log  ai1:m-1 nie1w:m-1 ,aim niemw
+
+-Dimold    nim ew   |s,     i1:m-1
+
+                              new
+
+by Inequality 20
+
+n
+
+ E m=1     ai1:m-1 nie1w:m-1 ,aim oilm d              Aim      (s,  ai1:m-1    ,  aim  )  -    log   oim ld    aim |s
+
+                                                         old
+
+-Dimold    oim ld   |s,  i1:m-1
+
+                           new
+
+= Eaold                                          n                     - Dold (old |s) .
+
+                    Aold (s, a) +  H oild ·i|s
+
+                                                i=1
+
+                                                           28
+Published as a conference paper at ICLR 2024
+
+The resulting inequality can be equivalently rewritten as
+
+                                                   n                                            (27)
+
+    Eanew [Qold (s, a)] +  H niew ·i|s - Dold (new |s)
+
+                                                 i=1
+                                                        n
+
+     Eaold [Qold (s, a)] +  H oild ·i|s - Dold (old |s) , s  S.
+
+                                                      i=1
+
+We use it to prove the claim as follows,
+
+                                                                     n  - Dold (new |s)
+
+Vnew (s) = Eanew [Qnew (s, a)] +  H niew ·i|s
+
+                                                                   i=1
+                                                                    n
+
+           = Eanew [Qold (s, a)] +  H niew ·i|s
+
+                                                                  i=1
+
++ Dold (new |s) + Eanew [Qnew (s, a) - Qold (s, a)] ,
+by Inequality 27
+
+                                                   n                    - Dold (old |s)
+
+ Eaold [Qold (s, a)] +  H oild ·i|s
+
+                                                 i=1
+
++ Dold (new |s) + Eanew [Qnew (s, a) - Qold (s, a)] ,
+
+= Vold (s) + Dold (new |s) + Eanew [Qnew (s, a) - Qold (s, a)]
+
+= Vold (s) + Dold (new |s) + Eanew ,sP [r(s, a) + Vnew (s) - r(s, a) - Vold (s)]
+
+= Vold (s) + Dold (new |s) + Eanew ,sP [Vnew (s) - Vold (s)]
+
+    Vold  (s)  +    inf     [Vnew  (s) - Vold     (s)] .
+
+                     s
+
+Hence     Vnew (s) - Vold (s)              inf   [Vnew  (s) - Vold      (s)] .
+
+                                              s
+
+Taking infimum over s and simplifying
+
+(1  -  )  inf  [Vnew  (s)   -  Vold  (s)]      0
+
+           s
+
+Therefore, infs [Vnew (s) - Vold (s)]  0, which proves the lemma.
+
+Then, any algorithm derived from Algorithm 1 ensures that the resulting policies satisfy Condition
+25, as demonstrated by the following lemma.
+
+Lemma G.2. Suppose an agent im maximizes the expected MEHAMO
+
+          nim ew  =       arg max          Esold          M V (s) . (im )                       (28)
+                      ( im Uimold oilm d  )
+                                                               Dim ,nie1w:m-1
+                                                                                old
+
+Then, for every state s  S
+
+                  M V (niemw )            old  (s)      M V (oilm d )      old           (s).   (29)
+
+                       Dim ,nie1w:m-1                        Dim ,nie1w:m-1
+
+Hence, new attains the properties provided by Lemma G.1.
+
+Proof. We will prove this statement by contradiction. Suppose that there exists s0  S such that
+
+               M V (niemw )          old       (s0) <   M V (oilm d )      old           (s0).
+
+                    Dim ,nie1w:m-1                           Dim ,nie1w:m-1
+
+Let us define the following policy ^im .
+
+                            ^im ·im |s =          oim ld ·im |s , at s = s0
+                                                  nim ew ·im |s , at s = s0
+
+                                                  29
+Published as a conference paper at ICLR 2024
+
+Note that ^im is (weakly) closer to oim ld than nim ew at s0, and at the same distance at other states.
+                                oim ld                                            oim ld . Further,
+Together with nim ew     U im           ,  this  implies  that  ^im    U im
+
+                           old                                           old
+
+Esold                 M V (s) - E (^im )   old                  sold   M V (niemw )        old       (s)
+
+                           Dim ,nie1w:m-1                                   Dim ,nie1w:m-1
+
+                               ( ) ^im                                 ( ) niemw           (s0)
+= old (s0)                  M V Dim ,nie1w:m-1            (s ) - M V 0                               > 0.
+                                                 old                   Dim ,nie1w:m-1 old
+
+The above contradicts nim ew as being the argmax of Equality 28, as ^im is strictly better. The
+contradiction finishes the proof.
+
+Next, we prove the most fundamental theorem of MEHAML.
+
+Theorem 3 (The Core Theorem of MEHAML). Let 0  , and the sequence of joint policies
+(k)k=0 be obtained by a MEHAML algorithm 1 induced by Di, U i, i  N , and . Then, the
+joint policies induced by the algorithm enjoy the following list of properties (1) Attain the monotonic
+improvement property J (k+1)  J (k), (2) Their value functions converge to a quantal response
+value function limk Vk = V QRE, (3) Their expected returns converge to a quantal response
+return limk J (k) = JQRE, (4) Their -limit set consists of quantal response equilibria.
+
+Proof. Proof of Property 1.
+It follows from combining Lemma G.1 & G.2.
+
+Proof of Properties 2, 3 & 4.
+
+Step 1: convergence of the value function. By Lemma G.1, we have that Vk (s)  Vk+1 (s), s 
+S, and that the value function is upper-bounded by Vmax. Hence, the sequence of value functions
+(Vk )kN converges. We denote its limit by V .
+
+Step 2: characterisation of limit points. As the joint policy space  is bounded, by Bolzano-
+Weierstrass theorem, we know that the sequence (k)kN has a convergent subsequence. Therefore,it
+has at least one limit point policy. Let ¯ be such a limit point. We introduce an auxiliary notation: for
+a joint policy  and a permutation i1:n, let HU (, i1:n) be a joint policy obtained by a MEHAML
+update from  along the permutation i1:n.
+
+Claim: For any permutation z1:n  Sym(n),
+
+                                                 ¯ = HU (¯ , z1:n)
+
+Proof of Claim. Let ^ = HU (¯ , z1:n) = ¯ and (kr )rN be a subsequence converging to ¯ . Let
+
+us recall that the limit value function is unique and denoted as V . Writing Ei01:: n [·] for the expectation
+operator under the stochastic process i1k:n kN of update orders, for a state s  S, we have
+
+                      0  =  lim  Ei10:: n  Vkr+1 (s) - Vkr (s)
+
+                            r
+
+                      as every choice of permutation improves the value function
+
+                       lim P        ik1:rn = z1:n     VHU(kr ,z1:n)(s) - Vkr (s)
+
+                          r
+
+                      =  p  (z1:n)  lim    VHU(kr ,z1:n)(s) - Vkr (s)             .
+
+                                    r
+
+By the continuity of the expected MEHAMO (following from the continuity of the state-action
+
+value function (Lemma A.2), the entropy term, HADFs, neighbourhood operators, and the sampling
+distribution) we obtain that the first component of HU (kr , z1:n), which is kz1r+1, is continuous in
+kr by Berge's Maximum Theorem (1). Applying this argument recursively for z2, . . . , zn, we have
+that HU (kr , z1:n) is continuous in kr .Hence, as kr converges to ¯, its HU converges to the HU
+of ¯, which is ^ . Hence, we continue writing the above derivation as
+
+                              = p (z1:n) [V^ (s) - V¯ (s)]  0, by Lemma G.1.
+As s was arbitrary, the state-value function of ^ is the same as that of  : V^ = V¯ , by the Bellman
+equation 5: Q(s, a) = r(s, a) + E [V (s)], this also implies that their state-action value functions
+
+                                                          30
+Published as a conference paper at ICLR 2024
+
+are the same: Q^ = Q¯ . Let m be the smallest integer such that ^zm = ¯zm . This means that ^zm
+achieves a greater expected MEHAMO than ¯zm . Hence,
+
+         Es¯             M V (^zm )            (s)    > Es¯             M V (¯zm )             (s)
+
+                              Dzm ,¯ z1:m-1 ¯                                Dzm ,¯ z1:m-1 ¯
+
+then for some state s,
+
+                         M V (^zm )            (s) >          M V (¯zm )            (s)
+
+                              Dzm ,¯ z1:m-1 ¯                      Dzm ,¯ z1:m-1 ¯
+
+which can be written as
+
+Eaz1:m-1 ¯ z1:m-1 ,azm ^zm    Qz1:m  (s,  az1:m-1  ,  azm  )  -    log  ^zm  (azm  |s)  - Dz¯m (^zm |s, ¯ z1:m-1 )
+
+                                 ¯
+
+= Eaz1:m-1 ¯ z1:m-1 ,azm ^zm     Qz1:m    (s,  a , z1:m-1  azm )  -     log  ^zm  (azm |s)  - Dz¯m (^zm |s, ¯ z1:m-1 )
+
+                                    ^
+
+> Eaz1:m-1 ¯ z1:m-1 ,azm ¯zm     Qz1:m    (s,  a , z1:m-1  azm )  -     log  ¯zm  (azm |s)  - Dz¯m (¯zm |s, ¯ z1:m-1 )
+
+                                    ¯
+
+= Eaz1:m-1 ¯ z1:m-1 ,azm ¯zm     Qz1:m    (s,  a , z1:m-1  azm )  -     log  ¯zm  (azm |s)  .
+
+                                    ¯
+
+Adding both sides of the inequality by             m-1     H  (¯zi   (·|s))  and  using  the   equation  V (s)  =
+                                                   i=1
+                         n       i (·|s)
+Ea Q(s, a) +             i=1  H                gives
+
+                                                                 n
+
+         V^ (s) = Ea^ Q^ (s, a) +  H ^i (·|s)
+
+                                                               i=1
+                                                       n
+
+          Ea^ Q^ (s, a) +  H ^i (·|s) - Dz¯m (^zm |s, ¯ z1:m-1 )
+
+                                                     i=1
+                                                       n
+
+         > Ea¯ Q¯ (s, a) +  H ¯i (·|s)
+
+                                                     i=1
+
+         = V¯ (s).
+
+However, we have V^ = V which yields a contradiction, proving the claim.
+
+Step 3: dropping the HADF. Consider an arbitrary limit point joint policy ¯ . By Step 2, for any
+permutation i1:n, considering the first component of the HU,
+
+¯i1 = arg max Es¯                    MD(ii11 )V¯ (s)
+
+           i1 Ui¯1 (¯i1 )
+
+         = arg max Es¯ Eai1 i1 Qi¯1 s, ai1 -  log i1 ai1 |s                              - Di¯1 i1 |s
+                                                                                         - Di¯1 i1 |s .
+             i1 Ui¯1 (¯i1 )
+
+         = arg max Es¯ Eai1 i1 Ai¯1 s, ai1 -  log i1 ai1 |s
+
+             i1 Ui¯1 (¯i1 )
+
+Suppose that there exists a policy  = ¯i1 , and a state s, such that
+
+          = arg max Eai1 i1 Ai¯1 s, ai1 -  log i1 ai1 |s ,                                               (30)
+
+                  i1 Ui¯1 (¯i1 )
+
+implies
+
+         Eai1  Ai¯1 (s, ai1 ) -  log  ai1 |s > Eai1 ¯i1 Ai¯1 (s, a) -  log ¯i1 ai1 |s
+
+which can be written as
+
+         Eai1  Ai¯1 (s, ai1 ) + H  ·i1 |s > H ¯i1 ·i1 |s .
+
+                                                      31
+Published as a conference paper at ICLR 2024
+
+For any policy i1 , consider the canonical parameterisation i1 (·i1 |s) = x1, . . . , xm-1,
+
+1-    m-1    xi      , where m is the size of the action space. We have that
+      i=1
+
+                                               m
+
+                     Eai1 i1 Ai¯1 (s, ai1 ) =       i1 aii1 |s Ai¯1  s, aii1
+                                                                     s, am i1
+                                               i=1
+
+                                                              
+
+                        m-1                         m-1
+
+                     =       xiAi¯1 s, aii1 + 1 -        xj  Ai¯1
+
+                        i=1                         j=1
+
+                        m-1
+
+                     =       xi Ai¯1 s, aii1 - Ai¯1 s, am i1  + Ai¯1 s, aim1 .
+
+                        i=1
+
+This means that Eai1 i1 Ai¯1 (s, ai1 ) is an affine function of i1 (·i1 |s), and thus, its Gâteaux deriva-
+tives are constant in P(A) for fixed directions. Hence, we can obtain that Eai1 i1 Ai¯1 (s, ai1 ) +
+H i1 ·i1 |s is a strict concave function of i1 (·i1 |s) (following from the affinity of
+
+Eai1 i1 Ai¯1 (s, ai1 ) and the strict concavity of H i1 ·i1 |s ). Therefore, by combining the
+Equation 30 and the strict concavity of Eai1 i1 Ai¯1 (s, ai1 ) + H i1 ·i1 |s , Gâteaux deriva-
+tive of Eai1 i1 Ai¯1 (s, ai1 ) + H i1 ·i1 |s , in the direction from ¯ to , is strictly positive.
+
+Furthermore, the Gâteaux derivatives of Di¯1 (i1 |s) are zero at i1 (·i1 |s) = ¯i1 (·i1 |s) by its defini-
+tion (zero gradient). Hence, the Gâteaux derivative of Eai1 i1 Ai¯1 (s, a) + H i1 ·i1 |s -
+Di¯1 i1 |s is strictly positive. Therefore, for conditional policies ^i1 (·i1 |s) sufficiently close to
+¯i1 (·i1 |s) in the direction towards (·i1 |s), we have
+
+                     Eai1 ^i1 Ai¯1 (s, ai1 ) + H ^i1 ·i1 |s - Di¯1 (^i1 |s)                  (31)
+                     > Eai1 ¯i1 Ai¯1 (s, ai1 ) + H ¯i1 ·i1 |s - Di¯1 (¯i1 |s).
+
+Let us construct a policy ~i1 as follows. For all states y = s, we set ~i1 (·i1 |y) = ¯i1 (·i1 |y).
+
+Moreover, for ~i1 (·i1 |s) we choose ^i1 (·i1 |s) as in Inequality 31, sufficiently close to ¯i1 (·i1 |s), so
+
+that  ~i1    U i1    ¯i1 . Then, we have
+
+               ¯ i1
+
+             Es¯ ,ai1 ~i1 Ai¯1 (s, ai1 ) + Es¯ H ~i1 ·i1 |s - Di¯1 (~i1 |s)
+
+             > Es¯ ,ai1 ¯i1 Ai¯1 (s, ai1 ) + Es¯ H ¯i1 ·i1 |s - Di¯1 (¯i1 |s) ,
+
+which yields a contradiction. Hence, the assumption was false. Thus, we have proved that, for every
+
+state s,
+
+                 ¯i1 ·i1 |s = arg max Eai1 i1 Ai¯1 s, ai1 -  log i1 ai1 |s
+
+                                        i1 Ui¯1 (¯i1 )
+
+                        = arg max Eai1 i1 Qi¯1 s, ai1 -  log i1 ai1 |s .
+
+                            i1 Ui¯1 (¯i1 )
+
+Step 4: Quantal response equilibrium. We have proved that ¯ satisfies
+
+                     ¯i ·i|s = arg max Eaii Qi¯ s, ai -  log i ai|s
+
+                                         i (·i |s)P (Ai )
+
+                        = arg max Eaii,a-i¯ -i [Q¯ (s, a)]
+
+                            i (·i |s)P (Ai )
+
+                                 n         j aj|s log j aj|s , i  N , s  S.
+
+                        -
+
+                             j=1 aj Aj
+
+Then following the proof of Theorem 1, we have
+
+                     ¯i ai|s :=      exp   -1Ea-i¯ -i Q¯       s, ai, a-i     a-i)]) .
+                                           exp (-1Ea-i¯ -i    [Q¯ (s, bi,
+                                    bi Ai
+
+                                               32
+Published as a conference paper at ICLR 2024
+Thus, ¯ is a quantal response equilibrium. Lastly, this implies that the value function corresponds to
+a quantal response value function V QRE, the return corresponds to a quantal response return JQRE.
+
+                                                          33
+Published as a conference paper at ICLR 2024
+
+H EXPERIMENTAL DETAILS
+
+H.1 AUTOMATICALLY ADJUSTING TEMPERATURE
+
+We implement an automated temperature tuning method for HASAC which draws on the auto-tuned
+temperature extension of SAC (9). Thus, we adjust  with the following objective:
+
+                                J () = EstD,at[- log (at|st) - H¯],
+where H¯ is the target entropy.
+
+H.2 EXPERIMENTAL SETUP AND ADDITIONAL RESULTS
+
+H.2.1 BI-DEXHANDS
+
+Bi-DexHands (2) offers numerous bimanual manipulation tasks that are designed to match various
+human skill levels. Building on the Isaac Gym simulator, Bi-DexHands supports running thousands
+of environments simultaneously. This increases the number of samples generated in the same time
+interval, thus significantly alleviating the sample efficiency problem of on-policy algorithms.
+
+We evaluate HASAC on nine tasks simulating human behaviors across different ages and compare it
+with on-policy algorithms HAPPO, MAPPO, PPO, and off-policy algorithms HATD3 and SAC, as
+shown in Figure 7. Despite leveraging GPU parallelization, we observe that the sample efficiency
+of on-policy algorithms remains significantly lower than that of off-policy algorithms. In the most
+challenging Catch Abreast, Two Catch Underarm, and Lift Underarm tasks, on-policy algorithms
+fail to learn useful policies within 10m steps. While the off-policy algorithm HATD3 demonstrates
+higher sample efficiency compared to on-policy algorithms, it exhibits substantial variance during
+training due to the deterministic policies it learned, eventually converging to local optima. In contrast,
+our algorithm HASAC outperforms the other five methods by a large margin, showcasing faster
+convergence speed and lower variance.
+
+H.2.2 MULTI-AGENT MUJOCO
+
+MuJoCo tasks challenge a robot to learn an optimal way of motion; Multi-Agent MuJoCo (MAMu-
+JoCo) models each part of a robot as an independent agent, for example, a leg for a spider or an
+arm for a swimmer. With the increasing variety of body parts, improving each agent's exploration
+becomes necessary. Although the easier tasks with fewer agents can be solved by a wide range
+of different algorithms, the more complex benchmarks, such as the HumanoidStandup 17x1 and
+ManyAgentSwimmer 10x2, are difficult to solve with current MARL algorithms.
+
+We compare our method to several algorithms that show the current state-of-the-art performance in
+10 tasks of 5 scenarios in MAMuJoCo, including HAPPO, a sequential-update on-policy algorithm;
+MAPPO, a simultaneous-update on-policy algorithm; and HATD3 (45), an off-policy algorithm that
+outperforms HADDPG and MADDPG. Figure 8 demonstrates that, in all scenarios, HASAC enjoys
+superior performance over the three rivals both in terms of reward values and learning speed.
+
+H.2.3 STARCRAFT MULTI-AGENT CHALLENGE
+
+StarCraft Multi-Agent Challenge (SMAC) (25) contains a set of StarCraft maps in which a team of
+ally units aims to defeat the opponent team. Notably, MAPPO (42), HAPPO, and HATRPO have
+demonstrated remarkable performance on this benchmark through the utilization of five influential
+factors that significantly impact algorithm performance.
+
+We evaluate our method on four hard maps and four super-hard. Our experimental results, illustrated
+in Figure 9, reveal that HASAC achieves over 90% win rates in 7 out of 8 maps and significantly
+outperforms other strong baselines in most maps. Notably, in particularly challenging tasks such as
+5m_vs_6m, 3s5z_vs_3s5z, and 6h_vs_8z, we observe that HAPPO and HATRPO would converge
+towards suboptimal NE. In addition, FOP is unable to learn meaningful joint policy in super-hard
+tasks due to its reliance on the IGO assumption. By contrast, HASAC consistently achieves superior
+performance and shows the ability to identify higher reward equilibria due to its extensive exploration.
+We also observe that HASAC has better stability and higher learning speed across most maps.
+
+                                                          34
+Published as a conference paper at ICLR 2024
+
+                50        ShadowHandCatchAbreast                                        ShadowHandTwoCatchUnderarm                          400            ShadowHandLiftUnderarm
+
+                                                                             20.0                                                                     PPO
+                                                                                                                                                      SAC
+                40                                                           17.5                                                                     MAPPO
+                                                                                                                                            300       HAPPO
+                                                                             15.0
+                30                                                                                                                                    HATD3
+Episode Return                                               Episode Return                                                 Episode Return            HASAC
+                                                                             12.5                                                           200
+
+                20                                                           10.0
+
+                10                                                           7.5                                                            100
+
+                                                                             5.0
+
+                0                                                            2.5                                                            0
+
+                     0.0  0.2  0.4 Step 0.6    0.8   11.e07                  0.0   0.0  0.2  0.4 Step 0.6  0.8      11.e07                       0.0       0.2  0.4 Step 0.6   0.8  11.e07
+
+                          (a) Catch Abreast                                        (b) Two Catch Underarm                                             (c) Lift Underarm
+
+                               ShadowHandOver                                         ShadowHandCatchOver2Underarm                                              ShadowHandPen
+
+                30                                                           30                                                             175       PPO
+                                                                                                                                                      SAC
+                                                                             25                                                                       MAPPO
+                25                                                                                                                          150       HAPPO
+
+Episode Return  20                                           Episode Return  20                                             Episode Return  125       HATD3
+                                                                                                                                                      HASAC
+                                                                                                                                            100
+                15                                                           15
+                                                                             10                                                             75
+                                                                              5
+                10                                                                                                                          50
+
+                5                                                                                                                           25
+
+                0                                                            0                                                              0
+
+                     0.0  0.2  0.4 Step 0.6    0.8   11.e07                        0.0  0.2  0.4 Step 0.6  0.8      11.e07                       0.0       0.2  0.4 Step 0.6   0.8  11.e07
+
+                          (d) Hand Over                                        (e) Catch Over2Underarm                                                          (f) Hand Pen
+
+                          ShadowHandDoorCloseInward                                      ShadowHandDoorOpenInward                                     ShadowHandDoorOpenOutward
+
+                                                                             500                                                                      PPO
+                                                                             400                                                            500       SAC
+                400                                                          300                                                                      MAPPO
+                                                                             200                                                                      HAPPO
+                                                                             100                                                            400       HATD3
+
+Episode Return  300                                          Episode Return    0                                            Episode Return  300       HASAC
+
+                200                                                                                                                         200
+
+                100                                                                                                                         100
+
+                                                                                                                                            0
+
+                     0.0  0.2  0.4 Step 0.6    0.8   11.e07                        0.0  0.2  0.4 Step 0.6  0.8      11.e07                       0.0  0.2       0.4 Step 0.6   0.8  11.e07
+
+                          (g) Door Close Inward                                         (h) Door Open Inward                                     (i) Door Open Outward
+
+                   Figure 7: Comparisons of average episode return on nine Bi-DexHands tasks.
+H.2.4 GOOGLE RESEARCH FOOTBALL
+
+Google Research Football Environment (GRF) contains a set of cooperative multi-agent challenges
+in which a team of agents plays a team of bots in various football scenarios. Recent works (42; 45)
+have conducted experiments on academic scenarios and achieved nearly 100% winning rate on each
+scenario except two very challenging tasks: run pass and shoot with keeper (RPS) and corner. We
+apply HASAC to these two academy tasks of GRF, with QMIX and several SOTA methods, including
+HAPPO and MAPPO as baselines. Since GRF lacks a global state interface, we propose a solution
+to address this limitation by implementing a global state based on agents' observations following
+the Simple115StateWrapper of GRF. Concretely, the global state consists of common components
+in agents' observations and the concatenation of agent-specific parts and is taken as input by the
+centralized critic for value prediction. Additionally, we employ the dense-reward setting. All methods
+are trained for 20 million environment steps in the RPS task and for 25 million environment steps in
+the corner task.
+
+As shown in Figure 10a and 10b, we generally observe that both MAPPO and HAPPO tend to
+converge to a non-optimal NE on the two challenging tasks with a winning rate of approximately
+80%. This suboptimal convergence can be attributed to the insufficient level of exploration of these
+algorithms. In contrast, HASAC exhibits the ability to attain a higher reward equilibrium by learning
+stochastic policies, which effectively enhance exploration and robustness. This finding highlights
+the crucial role of stochastic policies in improving exploration, thereby enabling agents to converge
+toward a higher reward equilibrium.
+
+H.2.5 MULTI-AGENT PARTICLE ENVIRONMENT
+
+We evaluate HASAC on the Spread, Reference, and Speaker_Listener tasks of the Multi-Agent Particle
+Environment (MPE) (19), which were implemented in PettingZoo (31). PettingZoo incorporates
+
+                                                                                             35
+Published as a conference paper at ICLR 2024
+
+(a) 2x4-Agent Ant          (b) 4x2-Agent Ant          (c) 8x1-Agent Ant
+
+(d) 2x3-Agent HalfCheetah  (e) 3x2-Agent HalfCheetah  (f) 6x1-Agent HalfCheetah
+
+(g) 2x3-Agent Walker       (h) 6x1-Agent Walker       (i) 10x2-Agent Swimmer
+
+(j) 17x1-Agent HumanoidStandup
+
+            Figure 8: Comparisons of average episode return on multiple Multi-Agent MuJoCo tasks.
+MPE with some minor adjustments and allows for customizing the number of agents and landmarks,
+as well as the global and local rewards. To adapt these tasks to fully cooperative MARL settings,
+we sum up the individual rewards of agents to form a joint reward. The results presented in Figure
+11 shows that HASAC consistently outperforms the baselines in terms of both average return and
+sample efficiency.
+
+H.2.6 LIGHT AIRCRAFT GAME
+
+In addition to the previous three well-established benchmarks, we extend our experiments to include a
+novel environment called Light Aircraft Game (LAG) (23). LAG is a recently developed cooperative-
+competitive environment for red and blue aircraft games, offering various settings such as single
+control, 1v1, and 2v2 scenarios. In the context of multi-agent scenarios, LAG currently supports self-
+play only for 2v2 settings. To address this limitation, we introduce a novel cooperative non-weapon
+task where two agents collaborate to combat two opponents controlled by the built-in AI. Specifically,
+the agents are trained to fly towards the tail of their opponents and maintain a suitable distance.
+
+                                                          36
+Published as a conference paper at ICLR 2024
+
+                                            8m vs 9m                                                    1.0            5m vs 6m                                                                                 3s5z
+
+                       1.0                                                                                                                                                              1.0
+
+                       0.8                                                                              0.8                                                                             0.8
+
+Evaluate winning rate  0.6                                                       Evaluate winning rate  0.6                                                      Evaluate Winning Rate  0.6
+
+                       0.4                                                                              0.4                                                                             0.4                                    FOP
+
+                                                                                                                                                                                                                               QMIX
+                                                                                                                                                                                                                               MAPPO
+                       0.2                                                                              0.2                                                                             0.2                                    HAPPO
+
+                                                                                                                                                                                                                               HATRPO
+                                                                                                        0.0                                                                                                                    HASAC
+                       0.0                                                                                                                                                              0.0
+
+                            0.0  0.2  0.4 Step 0.6    0.8  11.e07                                            0.0  0.2  0.4 Step 0.6  0.8       11.e07                                        0.0       0.2  0.4 Step 0.6  0.8        11.e07
+
+                             (a) 8m-vs-9m (hard)                                                             (b) 5m-vs-6m (hard)                                                                        (c) 3s5z (hard)
+
+                                           10m vs 11m                                                                          MMM2                                                     1.0                 3s5z vs 3s6z
+
+                       1.0                                                                              1.0                                                                                       FOP
+                                                                                                                                                                                                  QMIX
+                                                                                                                                                                                        0.8       MAPPO
+                       0.8                                                                              0.8                                                                                       HAPPO
+Evaluate winning rate                                                            Evaluate Winning Rate                                                           Evaluate winning rate
+                       0.6                                                                              0.6                                                                             0.6       HATRPO
+                                                                                                                                                                                                  HASAC
+
+                       0.4                                                                              0.4                                                                             0.4
+
+                       0.2                                                                              0.2                                                                             0.2
+
+                       0.0                                                                              0.0                                                                             0.0
+                                                                                                            0.00 0.25 0.50 0.75 S1t.0e0p 1.25 1.50 1.75 21.0e07
+                            0.0  0.2  0.4 Step 0.6    0.8  11.e07                                                                                                                            0.00 0.25 0.50 0.75 S1t.0e0p 1.25 1.50 1.75 21.0e07
+
+                           (d) 10m-vs-11m (hard)                                                           (e) MMM2 (super hard)                                                        (f) 3s5z-vs-3s6z (super hard)
+
+                                             corridor                                                                         6h vs 8z
+
+                       1.0                                                                              1.0
+                       0.8
+Evaluate Winning Rate  0.6                                                       Evaluate winning rate  0.8
+                       0.4
+                       0.2                                                                              0.6
+                       0.0
+                                                                                                        0.4                               FOP
+
+                                                                                                                                          QMIX
+                                                                                                        0.2                               MAPPO
+                                                                                                                                          HAPPO
+                                                                                                                                          HATRPO
+                                                                                                        0.0                               HASAC
+
+                            0.00 0.25 0.50 0.75 S1t.0e0p 1.25 1.50 1.75 21.0e07                              0.0 0.5 1.0 1.5 S2t.e0p 2.5 3.0 3.5 41.e07
+
+                            (g) corridor (super hard)                                                        (h) 6h-vs-8z (super hard)
+
+Figure 9: Performance comparison on eight SMAC tasks. We generally observe that HASAC consistently
+outperforms other baselines in most tasks, exhibiting higher convergence speed and better stability.
+
+                                 (a) RPS (2 agents)                                                               (b) Corner (11 agents)                                                     (c) Non-weapon (2 agents)
+
+Figure 10: Performance comparison on two GRF tasks and one LAG task. HASAC achieves superior performance
+to the other methods.
+
+We compare our method to MAPPO and HAPPO on the cooperative non-weapon task involving
+2 agents. Figure 10c demonstrates that HASAC outperforms both MAPPO and HAPPO in terms
+of learning speed and stability. Specifically, HASAC exhibits faster convergence and achieves a
+higher level of stability throughout the learning process. In contrast, MAPPO and HAPPO exhibit
+considerable variability in their performance and display slower learning speeds.
+
+H.3 HYPER-PARAMETER SETTINGS FOR EXPERIMENTS
+
+Before presenting the hyperparameters employed in our experiments, we would like to clarify the
+reporting conventions we adhere to. First, we introduce a boolean variable auto_alpha to indicate
+whether the temperature is auto-tuned or not. Also, the hyperparameters will only take effect when
+
+                                                                                                                       37
+Published as a conference paper at ICLR 2024
+
+                               Reference (continuous)                           5      Speaker Listener (continuous)                                        Spread (continuous)
+
+                10                                                              10                                                          60
+
+                20                                                              15                                                          70
+
+Episode Return                                                  Episode Return  20                                          Episode Return  80
+
+                30                                                              25
+
+                40                                                              30                                                          90                                      HATRPO
+
+                                                                                35                                                          100                                     MAPPO
+                                                                                                                                                                                    HAPPO
+                50                                                              40                                                                                                  HATD3
+                                                                                                                                                                                    HASAC
+                                                                                45 0                                                        110
+
+                    0  1  2 Episode 3                  4  15e6                         1  2 Episode 3  4              15e6                       0  1  2 Episode 3               4  15e6
+
+                    (a) Reference (continuous)                  (b) Speaker Listener (continuous)                                                   (c) Spread (continuous)
+
+                          Reference (discrete)                                  Speaker Listener (discrete)                                  60        Spread (discrete)
+                                                                                                                                             70
+                15                                                 10                                                                        80
+                                                                                                                                             90
+                20                                                              15                                                          100
+                                                                                                                                            110
+Episode Return  25                                              Episode Return                                              Episode Return  120
+
+                30                                                              20                                                               0
+
+                35
+
+                40                                                              25
+
+                45                                                              30                                                                                                  HATRPO
+                                                                                                                                                                                    MAPPO
+                50                                                                                                                                                                  HAPPO
+                                                                                                                                                                                    HASAC
+                55 0
+                       1  2 Episode 3                  4  15e6                      0  1  2 Episode 3  4              15e6                          1  2 Episode 3               4  15e6
+
+                      (d) Reference (discrete)                                  (e) Speaker Listener (discrete)                                     (f) Spread (discrete)
+
+                         Figure 11: Comparisons of average episode return on six MPE tasks.
+
+they are used. For instance, the temperature parameter  can be assigned any numerical value, but it
+is taken into consideration only when the boolean value auto_alpha is set to False. Similarly, the
+target_entropy and alpha_lr are applicable when auto_alpha is set to True.
+
+H.3.1 COMMON HYPER-PARAMETERS ACROSS ALL ENVIRONMENTS
+
+We implement the HASAC based on the HARL framework (45) and employ the existing implemen-
+tations of other algorithms, including HATD3, HAPPO, HATRPO, and MAPPO, as described in
+the HARL literature. In Google Research Football, we use the results of QMIX in Yu et al. (42).
+In StarCraft Multi-Agent Challenge, we use the results of FOP in Zhang et al. (44). To ensure
+comprehensive evaluation, we conduct training using a minimum of four different random seeds
+for each algorithm. Next, we offer the hyperparameters used for HASAC in Table 4 across all
+environments, which are kept comparable with the HATD3 for fairness purposes.
+
+Table 4: Common hyperparameters used for off-policy algorithms HASAC and HATD3 across all environments.
+
+                              hyperparameters                                             value        hyperparamerters                               value
+                             proper time limits                                           True           warmup steps                                  1e4
+                                                                                         ReLU           final activation                              Tanh
+                                  activation                                               1e6               polyak                                   0.005
+                                  buffer size                                          [256, 256]       update per train                                1
+                                 hidden sizes                                              50            target entropy                             -dim(Ai)
+                                train interval                                             0.2             noise clip                                  0.5
+                                 policy noise                                                           linear lr decay                               False
+                          policy update frequency                                           2
+
+H.3.2 BI-DEXHANDS
+
+In the Bi-DexHands domain, for SAC, PPO, MAPPO baselines we adopt the implementation and
+tuned hyperparameters reported in the paper (43). And for HAPPO we adopt the implementation and
+tuned hyperparameters reported in the HARL paper (45). Here we report the hyperparameters for
+HASAC and HATD3 in Table 5 and 6.
+
+H.3.3 MULTI-AGENT MUJOCO (MAMUJOCO)
+
+In this part, we report the hyperparameters used in MAMuJoCo tasks for HASAC and HATD3
+in Table 7, 8, 9, and 10. For the other three baselines, we utilize the implementation and tuned
+hyperparameters reported in the HARL paper (45).
+
+                                                                                          38
+Published as a conference paper at ICLR 2024
+
+Table 5: Common hyperparameters used for HASAC and HATD3 in the Bi-DexHands domain.
+
+hyperparameters   value     hyperparameters       value       hyperparameters        value
+ rollout threads   20            gamma            0.95            batch size         1000
+                                 critic lr        5e - 4            n step
+     actor lr     5e - 4                          False                               20
+ use huber loss   False      use valuenorm                    exploration noise       0.1
+
+Table 6: Different hyperparameters used for HASAC in the Bi-DexHands domain.
+
+               scenarios                          auto alpha     alpha   alpha lr
+     ShadowHandCatchAbreast                          True           /     3e - 4
+ ShadowHandTwoCatchUnderarm                          False
+     ShadowHandLiftUnderarm                          True        5e - 5      /
+                                                     True           /     3e - 4
+          ShadowHandOver                             True           /     3e - 4
+ShadowHandCatchOver2Underarm                         True           /     3e - 4
+                                                     True           /     3e - 4
+           ShadowHandPen                             True           /     3e - 4
+  ShadowHandDoorCloseInward                          True           /     3e - 4
+  ShadowHandDoorOpenInward                                          /     3e - 4
+ ShadowHandDoorOpenOutward
+
+Table 7: Common hyperparameters used for HASAC and HATD3 in the MAMuJoCo domain.
+
+hyperparameters             value                 hyperparameters   value
+ rollout threads             10                     train interval   50
+                                                       gamma        0.99
+     critic lr              1e - 3                 use valuenorm
+ use huber loss             False                                   False
+
+Table 8: Common hyperparameters used for HATD3 in the MAMuJoCo domain.
+
+hyperparameters value hyperparameters value
+
+                  actor lr  5e - 4 exploration noise 0.1
+
+Table 9: Parameter n_step used for HASAC and HATD3 in the MAMuJoCo domain.
+
+          scenarios         value                          scenarios          value
+           Ant 2x4            5                       HalfCheetah 2x3          10
+           Ant 4x2            5                       HalfCheetah 3x2          10
+           Ant 8x1            5                       HalfCheetah 6x1          10
+         Walker 2x3          20                                                20
+manyagent_swimmer 10x2       10                          Walker 6x1            10
+                                                  HumanoidStandup 17x1
+
+Table 10: Different hyperparameters used for HASAC in the MAMuJoCo domain.
+
+          scenarios         actor lr          auto alpha  alpha     alpha lr  batch size
+           Ant 2x4          3e - 4               False     0.2          /       2200
+           Ant 4x2          3e - 4               False     0.2          /       1000
+           Ant 8x1          3e - 4               False     0.2          /       2200
+      HalfCheetah 2x3       1e - 3               True       /                   1000
+      HalfCheetah 3x2       1e - 3               True       /        3e - 4     1000
+      HalfCheetah 6x1       1e - 3               True       /        3e - 4     1000
+         Walker 2x3         5e - 4               False     0.2       3e - 4     1000
+         Walker 6x1         5e - 4               False     0.2                  1000
+manyagent_swimmer 10x2      1e - 3               True       /           /       1000
+ HumanoidStandup 17x1       1e - 3               True       /           /       1000
+                                                                     3e - 4
+                                                                     3e - 4
+
+H.3.4 STARCRAFT MULTI-AGENT CHALLENGE (SMAC)
+
+In the SMAC domain, for MAPPO we adopt the implementation and tuned hyperparameters reported
+in the MAPPO paper (42). And for HAPPO and HATRPO we adopt the implementation and tuned
+
+                                              39
+Published as a conference paper at ICLR 2024
+
+Table 11: Common hyperparameters used for HAPPO and MAPPO in the MAMuJoCo domain.
+
+hyperparameters value hyperparameters value
+
+              batch size          4000            network          MLP
+
+              gamma               0.99 hidden sizes [256, 256]
+
+Table 12: Different hyperparameters used for HAPPO and MAPPO in the MAMuJoCo domain.
+
+          scenarios      linear   actor/critic    ppo/critic      clip  actor/critic  entropy
+                        lr decay       lr           epoch        param  mini batch      coef
+              Ant                                      5                                 0
+        HalfCheetah      False       5e - 4           15          0.1        1         0.01
+         Walker 2x3      False       5e - 4            5          0.05       1           0
+         Walker 6x1       True       1e - 3            5          0.05       2         0.01
+manyagent_swimmer 10x2   False       5e - 4            5          0.1        1         0.01
+ HumanoidStandup 17x1    False       5e - 4            5          0.2        1           0
+                          True       5e - 4                       0.1        1
+
+hyperparameters reported in the HARL paper (45). Here we report the hyperparameters for HASAC
+in Table 13 and 14.
+
+Table 13: Common hyperparameters used for HASAC in the SMAC domain.
+
+hyperparameters value hyperparameters value                hyperparameters   value
+
+rollout threads 20              state type        FP             batch size  1000
+
+use huber loss False use valuenorm False use policy active masks true
+
+Table 14: Different hyperparameters used for HASAC in the SMAC domain.
+
+     Map          critic lr  actor lr   gamma     auto     alpha   alpha lr  n step
+                                                  alpha
+ 8m_vs_9m         5e - 4     3e - 4      0.95     True        /     3e - 4     5
+ 5m_vs_6m         5e - 4     3e - 4      0.95     True        /     3e - 4     20
+                  5e - 4     3e - 4      0.99     True        /     3e - 4     20
+     3s5z         5e - 4     3e - 4      0.95     True        /     3e - 4     20
+10m_vs_11m        5e - 4     3e - 4      0.95     True        /     3e - 4     20
+                  5e - 4     3e - 4      0.99     True        /     3e - 4     10
+   MMM2           5e - 4     5e - 4      0.99     False    2e - 3              5
+3s5z_vs_3s6z      5e - 4     3e - 4      0.99     True        /        /       5
+                                                                    3e - 4
+   corridor
+  6h_vs_8z
+
+H.3.5 GOOGLE RESEARCH FOOTBALL (GRF)
+
+In the GRF domain, for MAPPO and QMIX baselines we adopt the implementation and tuned
+hyperparameters reported in the MAPPO paper (42). And for HAPPO we adopt the implementation
+and tuned hyperparameters reported in the HARL paper (45). Here we report the hyperparameters for
+HASAC in Table 15 and 16.
+
+Table 15: Common hyperparameters used for HASAC in the GRF domain.
+
+hyperparameters   value         hyperparameters   value    hyperparameters   value
+ rollout threads   20                gamma        0.99         batch size    1000
+                                     critic lr    5e - 4         n step
+     actor lr     5e - 4                          False                       10
+ use huber loss   False          use valuenorm
+
+Table 16: Different hyperparameters used for HASAC in the GRF domain.
+
+                        scenarios auto alpha alpha alpha lr
+
+                        RPS            False 1e - 4 /
+
+                        Corner         False 1e - 3           /
+
+                                              40
+Published as a conference paper at ICLR 2024
+
+H.3.6 MULTI-AGENT PARTICLE ENVIRONMENT (MPE)
+In this part, we report the hyperparameters for HASAC in Table 17.
+
+Table 17: Hyperparameters used for HASAC in the MPE domain.
+
+hyperparameters    value   hyperparameters        value   hyperparameters    value
+ rollout threads    20        batch_size          1000         critic lr     5e - 4
+                   0.99         actor lr          5e - 4        n_step
+     gamma         True         alpha lr          3e - 4                      20
+   auto alpha                                     False
+ use huber loss    False    use valuenorm
+
+H.3.7 LIGHT AIRCRAFT GAME (LAG)
+
+In this part, we report the hyperparameters for HASAC in Table 18 and the hyperparameters for
+MAPPO and HAPPO in Table 19.
+
+Table 18: Hyperparameters used for HASAC in the LAG domain.
+
+hyperparameters    value   hyperparameters        value   hyperparameters    value
+ rollout threads    20        batch_size          1000         critic lr     5e - 4
+                   0.99         actor lr          5e - 4        n_step
+     gamma         True         alpha lr          3e - 4                      10
+   auto alpha
+
+Table 19: Hyperparameters used for MAPPO and HAPPO in the LAG domain.
+
+hyperparameters    value   hyperparameters        value   hyperparameters       value
+    batch size     4000     linear lr decay       False     hidden sizes     [256, 256]
+                   5e - 4                         0.99         network
+  actor/critic lr               gamma                        clip param         MLP
+   ppo epoch         5       entropy coef           0                           0.05
+  critic epoch       5     actor mini batch         2     critic mini batch
+                                                                                  2
+
+                                              41
+Published as a conference paper at ICLR 2024
+
+I ABLATION STUDY ON SEQUENTIAL UPDATES
+
+In this section, we conduct an ablation study to investigate the effect of sequential updates. We
+compare the performance of the original HASAC with sequential update scheme, and HASAC
+without sequential updates (or MASAC), which updates each policy according to the following
+objective:
+
+Ji (i) = EstD  Eaiti i ,a- t i-o-ildi          log i i  ait|st  -  Qi      ;  st, ati, a-t i  .
+
+                                                                      old
+
+We run the experiments on nine Bi-DexHands tasks. For a fair comparison, we set the hyperparameters
+of MASAC to be the same as those of HASAC. Experiments results show that HASAC with sequential
+updates consistently achieves better performance.
+
+                  Tasks                            HASAC            MASAC
+     ShadowHandCatchAbreast                        45.9(4.3)        36.4(5.2)
+ ShadowHandTwoCatchUnderarm                        20.6(1.9)        17.2(1.1)
+     ShadowHandLiftUnderarm                       361.0(23.2)      345.0(9.7)
+                                                   31.1(0.7)        30.5(1.1)
+          ShadowHandOver                           28.7(0.4)        27.0(0.9)
+ShadowHandCatchOver2Underarm                      181.5(10.4)      163.8(18.6)
+                                                  429.8(16.7)      425.9(7.1)
+           ShadowHandPen                          475.6(23.8)      428.8(14.1)
+  ShadowHandDoorCloseInward                       542.1(13.1)      528.1(20.4)
+  ShadowHandDoorOpenInward
+ ShadowHandDoorOpenOutward
+
+Table 20: Averaged final performance on nine Bi-DexHands tasks.
+
+                                              42
+
