@@ -14,3 +14,7 @@ deepmimo_scenarios/
 # Generated experiment outputs
 results/
 H-HASAC/results/
+
+# Files with hardcoded secrets (use env vars instead)
+scripts/telegram_utils.py
+scripts/monitor_chasac_runs.py
