@@ -18,3 +18,11 @@ H-HASAC/results/
 # Files with hardcoded secrets (use env vars instead)
 scripts/telegram_utils.py
 scripts/monitor_chasac_runs.py
+
+# Local-only directories
+RL_Knowledge/
+poster/
+poster_template/
+report/
+REPO_MAP.md
+tims_sync_*.md
