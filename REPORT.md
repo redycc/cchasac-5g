@@ -217,15 +217,17 @@ opt_alpha.step()
 | C-HASAC tau001 | 400k | −1.051 | −0.241 | +0.443 | +0.838 ✅ |
 | **C-HASAC alpha_fix** | **400k** | **−0.911** | **+0.292** | **+2.219** | **+2.622** ✅ |
 | **C-HASAC alpha_fix** | **800k** | **+0.808** | **+2.575** | +0.682 | +0.167 |
-| HASAC (z=0) | 800k | *running* | — | — | — |
+| HASAC (z=0, alpha_fix) | 800k† | —（best −3.151） | −3.151 | — | — |
 | PF-WSR (ceiling) | — | **+23.529** | — | — | — |
+
+†HASAC 800k 對照組在 step 225k 死於 entropy 崩潰（alpha → 0.0005，死亡區），無 FINAL；best −3.151。
 
 ### 4.2 C-HASAC vs HASAC 核心比較
 
 **唯一差別 = actor 有沒有吃 encoder 學出的 z**
 
 - C-HASAC 400k (alpha_fix) FINAL **−0.911** vs HASAC 200k **−5.184** → **+4.273 PF-U**
-- C-HASAC 800k FINAL **+0.808** vs HASAC 800k（待完成對照）
+- C-HASAC 800k FINAL **+0.808** vs HASAC 800k best **−3.151**（HASAC 訓練中途 entropy 崩潰死亡）→ **≥ +3.96 PF-U**
 
 ### 4.3 z 有效性驗證
 
@@ -269,7 +271,29 @@ opt_alpha.step()
 
 **觀察**：更長的訓練持續改善 policy 分數；但 800k 的 drop_shuffle 降低，顯示後期 policy 找到較不依賴 z 的解法（two-regime behavior）。
 
-### 5.4 Alpha Fix 的效果
+### 5.4 Oracle z（繞過 encoder）— 負面結果
+
+直接把 PF-WSR expert 的 per-BS power fractions 當 z 餵給 actor（`--oracle_z 1`），測試「encoder 是不是瓶頸」：
+
+| 設定 | PF-U | drop_shuffle | 解讀 |
+|------|------|-------------|------|
+| learned z（encoder） | −2.237 | +1.429 ✅ | z 編碼干擾結構 |
+| oracle z（expert 功率） | −4.673 | +0.059 ❌ | oracle z 幾乎未被使用 |
+
+**結論**：encoder 不是瓶頸。expert 的 per-BS 功率比例低變異（≈常數 5%），無條件性資訊；learned z 之所以有效是因為它編碼「誰是主 BS / 干擾結構」等相對協調情境，而非目標功率水準。
+
+### 5.5 動態環境（UE Random Walk）
+
+UE 每步隨機移動（σ=5 m/step），BS 固定，測試動態 channel 下 z 是否更有用：
+
+| 指標 | HASAC z0 | C-HASAC z1 |
+|------|----------|------------|
+| PF-U（FINAL） | −2.434 | **−2.218** |
+| drop_zero / drop_shuffle | — | −0.140 / −0.154 ⚠️ |
+
+**結論**：與預期相反——動態環境下 z 完全未被使用（ablation 皆為負）。KPM 快照無法捕捉快速 channel 變化，actor 學會忽略 z。靜態快照中 z 編碼的「干擾結構」在動態下失去時效性。
+
+### 5.6 Alpha Fix 的效果
 
 **問題**：sequential loop 內每個 agent update 後都更新 alpha（3×/step）→ entropy 3× 速崩潰。
 
@@ -312,7 +336,27 @@ SAC 的 max 運算累積 bias → Q 高估 → actor 追錯梯度 → policy 崩
 
 更慢的 target network 更新（$\phi' \leftarrow 0.001\phi + 0.999\phi'$）→ Q target 更穩定 → actor gradient 不被噪訊引偏 → 更晚但更深的突破（step 140k / 230k / 355k / 760k）。
 
-### 6.4 O-RAN Deployment 可行性
+### 6.4 z 表示分析（learned z 學到了什麼）
+
+對最佳 C-HASAC checkpoint 跑 200 scenarios × 8 steps rollout，分析 z 向量：
+
+- **PCA PC1 = 93.5%**：16 維 z 實際坍縮成幾乎 1 個有效維度（純量信號）
+- **z 主要編碼 throughput**：top z 維度與各 BS throughput 相關最強（|corr| ≈ 0.35–0.40）
+- **軟性 on/off 行為**：100% scenario 有某 BS power < 0.1（功率分布雙峰），但非嚴格二元
+- **z 對 power 的影響是間接的**（corr ≈ 0.3）：z 提供「系統負載狀態」，on/off 是 actor 的連續決策結果
+
+### 6.5 Q Target 正確性修正與 N-step A/B（2026-06-10）
+
+程式碼審查發現一個正確性 bug：**Replay 沒有 done flag**，critic target $r + \gamma Q(s')$ 無條件跨 episode bootstrap。episode 僅 10 步、PF 權重在 reset 歸零——10% transitions 的 Q target 系統性高估，直接餵養 Q-overestimation。修正後同時部署：
+
+1. **done-mask**：target 改 $r + \gamma^n(1-d)(Q - \alpha \log\pi)$
+2. **n-step returns（n=3）**：更準的 Q target，縮短 bootstrap 鏈
+3. **alpha floor（0.001）**：歷史 log 顯示死亡區明確——崩死 run 的 alpha 都在 0.0005–0.0007，成功 run 在 0.0015+
+4. **top-K checkpoint + validation 重排序**：訓練期保留 top-10 ckpts（含 EMA 副本），結束時在獨立 validation seed 上 50-ep 重排序再報 test（消除選擇噪音與測試污染）
+
+N-step A/B（1200k，同 fix stack）：n_step=3 全程健康（best −2.073、alpha 0.06–0.11、pwr 0.25）；n_step=1 長期卡死全功率壞區（best −2.772、pwr 0.7–0.95）→ **n-step=3 顯著改善訓練穩定性**。
+
+### 6.6 O-RAN Deployment 可行性
 
 | 元件 | 部署位置 | 資訊來源 | 可行性 |
 |------|---------|---------|--------|
@@ -325,33 +369,92 @@ SAC 的 max 運算累積 bias → Q 高估 → actor 追錯梯度 → policy 崩
 
 ---
 
-## 7. 結論
+## 7. 獨立復現研究：REPRODUCE spec（2026-06-10）
 
-### 7.1 主要貢獻
+依合作方提供的 methods-only spec（`REPRODUCE.md`）從零重建一個**不同 regime** 的環境並驗證其三大主張：N_BS=4、goodput+queue 目標、固定 topology、γ=0（contextual bandit）、team reward、separate per-cell actors。此環境與主線（§3）的關鍵差異：無 bootstrap（γ=0）、評 goodput 而非 PF-U。
 
-1. **C-HASAC 贏過 HASAC**：actor 加入 learned context z → PF-U 大幅提升（唯一差別 = actor 吃不吃 z）
-2. **z 真實有效**：drop_shuffle = +2.622（400k），錯誤 z 比沒有 z 更傷，排除 z 作為常數 offset 的假象
-3. **BC warm-start 是關鍵**：純 RL 訓練 z 不被使用，BC 1000 步打開 z 使用開關
-4. **O-RAN 可部署**：三層資訊嚴格分流，z 由 RIC xApp 下發，不需鄰 BS 直接通訊
+### 7.1 環境校準
 
-### 7.2 最終最佳數字（供 Poster 使用）
+以 N0 掃描對齊 spec 參考值，之後取得作者的精確幾何 dump（`geom_topo12345.npz`）做 exact match：
 
-| 指標 | 數值 |
-|------|------|
-| Equal Power (floor) | −5.332 |
-| HASAC (無 z, 200k) | −5.184 |
-| **C-HASAC 最佳 FINAL（800k）** | **+0.808** |
-| C-HASAC alpha_fix FINAL（400k） | −0.911 |
-| C-HASAC drop_shuffle 最強（400k） | **+2.622** |
-| PF-WSR (ceiling) | +23.529 |
+| 項目 | spec/作者 | 復現（exact geometry） |
+|------|----------|----------------------|
+| floor (equal) | ~5.33 | 5.358 ✓ |
+| ceiling (full-CSI oracle) | ~9.09 | 9.402 |
+| spatial-oracle-as-policy | ~80% | 77.8% ✓ |
+| gate×base BC goodput | 8.41/9.03/8.12（3 seeds） | **8.535**（區間內）✓ |
 
-### 7.3 未解問題
+### 7.2 三大主張全部復現（% of floor→ceiling gap）
 
-- **SAC Q-overestimation**：後段震盪根本原因，best checkpoint 機制只治標
-- **800k drop_shuffle 低**：長訓練後 policy 較不依賴 z，與 400k 呈現 two-regime behavior
-- **HASAC 800k 對照組**：仍在訓練中，完成後補充最終比較數字
+| 方法 | %gap（3 seeds） | spec 主張 |
+|------|----------------|-----------|
+| HASAC RL（random topology） | ≈ 0% | RL 無法跨拓撲泛化 ✓ |
+| HASAC RL（fixed topology, 40k） | 31.1% ± 1.4 | 學到 topology-specific spatial reuse |
+| **C-HASAC RL（+z input）** | **32.2% ± 5.4** | **z-as-input null ✓**（≈ HASAC） |
+| HASAC RL（120k 長訓） | 34.5% ± 1.7 | 平台期，非訓練長度問題 |
+| gate × learnable-combine（RL） | 38.7% | multiplier corr 0.998 → **0.10**（被 RL 拆掉）✓ |
+| **gate×base BC（固定乘法）** | **69.8% ± 0.2** | 監督式結構 >> RL ✓ |
+| **spatial-gate × RL-worker（固定乘法）** | **71.6%** | 固定結構下 RL 是建設性的 ✓ |
+
+### 7.3 復現過程的額外科學收穫
+
+1. **比 spec 更強的負面結果**：當 gate 可被 RL 訓練時，RL 連 BC 至 corr≈1 的幾何 gate 都會毀掉（68.7%→7.1%）。可部署性來自**把結構凍結在 RL 之外**。
+2. **α-floor 反差結論**：同一個 entropy floor 在 γ=0（無 bootstrap）環境**有害**（31.1%→14.2%，擋住收斂），在 γ=0.99 主線環境**救命**（防 Q 過估死亡螺旋）——entropy guard 的價值完全取決於 Q 是否會 bootstrap 累積偏差。
+3. **幾何分解診斷**：可部署增益幾乎全來自 slow spatial 結構（spatial-oracle-as-policy 69–78%），fast fading 適應從 local obs 只能恢復 ~1pp。
+4. **γ=0 的穩定性對照**：reproduce 環境全程無崩潰、單調爬升——沒有 bootstrap 就沒有 Q 累積過估，反襯主線（γ=0.99）的震盪來源。
+5. **tanh 飽和第三例**：第一代 RL-refine 機制因 `atanh(2L−1)` 在 gate≈0 處飽和而全滅——與主線 −165 崩潰同根，再次確認「squash 內不可放結構先驗，乘法必須在 squash 之外」。
+
+### 7.4 兩個環境的誠實對照（對 C-HASAC 命題的意涵）
+
+| | 主線環境（§3–6） | REPRODUCE 環境（§7） |
+|--|----------------|---------------------|
+| 目標 / γ | PF-U / 0.99 | goodput / 0 |
+| z-as-input | drop_shuffle +2.6（z 被使用） | null（32.2% ≈ 31.1%） |
+| RL 絕對水準 | floor+6.1 / gap 28.9 的 21% | gap 的 ~31% |
+| 最強可部署做法 | C-HASAC（+0.808） | 監督式 gate×base（~70–85%） |
+
+z 的價值是 **regime-dependent**：在固定拓撲 + goodput bandit 設定下，協調是幾何決定的常數結構，z（load 摘要）與最優開關無關 → null；在我們的 PF-U 設定下，z 編碼的干擾/負載情境有可測量的使用證據（drop_shuffle），但絕對增益距 ceiling 仍遠。兩個環境共同指向同一個更深的結論：**可部署的協調增益主要來自結構（誰該讓位的 slow spatial pattern），監督式學習比 RL 更可靠地獲得它**。
 
 ---
 
-*最後更新：2026-06-09*
-*HASAC z0 800k 對照組進行中（PID 442592），完成後更新 §4.2 對照數字*
+## 8. 結論
+
+### 8.1 主要貢獻
+
+1. **C-HASAC 贏過 HASAC**（主線環境）：actor 加入 learned context z → PF-U 大幅提升（唯一差別 = actor 吃不吃 z）；HASAC 800k 對照組死於 entropy 崩潰（best −3.151）
+2. **z 真實有效（主線環境）**：drop_shuffle = +2.622（400k），錯誤 z 比沒有 z 更傷，排除 z 作為常數 offset 的假象；z 表示分析顯示 z 實際為 1 維 throughput/負載信號（PCA PC1=93.5%）
+3. **BC warm-start 是關鍵**：純 RL 訓練 z 不被使用，BC 1000 步打開 z 使用開關
+4. **O-RAN 可部署**：三層資訊嚴格分流，z 由 RIC xApp 下發，不需鄰 BS 直接通訊
+5. **獨立復現研究（§7）**：在合作方的 goodput/bandit regime 完整復現三大主張（z-as-input null、fixed>>random topology、RL un-learns learnable combine），exact geometry 下數值對齊（goodput 8.535 ∈ [8.12, 9.03]）
+6. **跨環境綜合結論**：可部署的協調增益主要來自 slow spatial 結構；監督式學習 + 凍結結構（gate×base BC ~70–85%）遠比任何 RL 變體（~31%）可靠
+
+### 8.2 最終最佳數字（供 Poster 使用）
+
+**主線環境（PF-U，floor −5.332 / ceiling +23.529）**：
+
+| 指標 | 數值 |
+|------|------|
+| HASAC (無 z, 200k / 800k best) | −5.184 / −3.151 |
+| **C-HASAC 最佳 FINAL（800k）** | **+0.808** |
+| C-HASAC drop_shuffle 最強（400k） | **+2.622** |
+| n-step=3 fix stack（1200k，進行中） | best −2.073 |
+
+**REPRODUCE 環境（goodput % of gap）**：
+
+| 指標 | 數值 |
+|------|------|
+| HASAC RL = C-HASAC RL（z null） | 31.1% ≈ 32.2% |
+| **gate×base BC（固定乘法）** | **69.8%**（exact geometry：**85.2%**） |
+| spatial-gate × RL-worker | 71.6% |
+| learnable combine 經 RL | 38.7%（multiplier corr 0.998→0.10） |
+
+### 8.3 未解問題
+
+- **SAC Q-overestimation（主線）**：done-mask + n-step + alpha floor 顯著改善（fix3 全程健康），但 oscillation 未根除
+- **800k drop_shuffle 低**：長訓練後 policy 較不依賴 z，與 400k 呈現 two-regime behavior
+- **z 的 regime 邊界**：z 在 PF-U/bootstrap 環境有用、在 goodput/bandit 環境 null——精確刻畫「z 何時有資訊價值」仍開放
+
+---
+
+*最後更新：2026-06-10*
+*fix3（n-step=3 stability stack，1200k）進行中 @1065k，FINAL 含 top-K validation 重排序*

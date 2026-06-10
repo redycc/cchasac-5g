@@ -1,8 +1,165 @@
 # cc-HASAC 實驗進度
 
-**專案方向（確認）**：比較 **vanilla HASAC（無 z）** vs **C-HASAC（有 z）**，唯一差別 = actor 有沒有吃 KPM encoder 學出的 latent context z。
+---
+
+## 🔁 REPRODUCE.md 復現任務（2026-06-10，群組指示「全部重新做一次」）— ✅ 完整收官
+
+**📄 報告更新（2026-06-10 13:00）**：REPORT.md 與 report/chasac_final_report.docx（gen_report_docx.py）全面更新：補 HASAC 800k 對照（entropy 死亡 best −3.151）、alpha_fix 400k/800k 主表、oracle_z / randomwalk / per-BS z ablations、z 表示分析（PCA PC1=93.5%）、穩定性修正包（done-mask/n-step/alpha floor/top-K validation）+ n-step A/B、新增 §7 REPRODUCE 復現研究全章（三大 claims + exact geometry 對齊 + α-floor 反差 + 跨環境綜合結論）、結論改寫。
+
+**🏁 最終結案（exact geometry，2026-06-10 12:10）**：群組上傳 `geom_topo12345.npz`（作者的精確幾何：g_ls/serv/bs/ue/N0=7.166e-16W/Pmax=3.162e-5W），所有數字對齊：
+
+| 項目 | 作者 | 我們（同幾何） |
+|------|------|---------------|
+| floor (equal) | ~5.33 | 5.358 ✓ |
+| ceiling (oracle) | ~9.09 | 9.402 |
+| spatial-oracle policy | 預測 ~80% | **77.8%** ✓ |
+| **gate×base BC goodput** | **8.41/9.03/8.12**（3 seeds） | **8.535** ✓（區間內！） |
+
+- gate×base BC = 8.535 ± 0.732，以作者 references 換算 = **85.2% of gap**，正中 spec 的 80-85%
+- **69.8% vs 80-95% 之謎正式定案**：同 topo_seed 但 draw-order 不同 → 不同 placement → 我們自產幾何 spatial 成分 69%、作者幾何 78-80%。方法實作完全一致，差異純粹來自幾何。
+- **三大 claims 全部復現**：#1 z-as-input null ✓、#2 fixed topology >> random（31.1% vs ≈0%）✓、#3 RL un-learns learnable combine（corr 0.998→0.10）、只有固定乘法存活（71.6% vs 38.7%）✓
+
+群組上傳 `tasks/files/REPRODUCE.md`（16.9KB methods-only spec）：N_BS=4、N_UE=8、goodput+queue、固定 topology（topo_seed=12345）、γ=0（contextual bandit）、40k steps。預期結論：**z-as-input null（C-HASAC ≈ HASAC ~48% gap）**；可部署增益來自 **gate×base 固定乘法 BC（~80-85%）**；RL un-learns learnable combine。
+
+**🔧 env_reproduce.py（2026-06-10）**：spec §2/§4/§5 忠實實現。channel(32.4+21log d+20log fc+shadow4dB)→SINR(intra-cell orthogonal)→rate→delivered=min(Q,rate)。queues(q_max=80, arr=8/slot/UE, hot-cold Markov)、PF w=1/(R̄+ε) β=0.05、team/difference reward、full-CSI oracle(K=5 grid)、spatial oracle(g_ls)、equal/RR baselines、fixed/random topology。
+- **N0 校準成功**：掃 {1e-13…1e-11}，**N0=1e-12 唯一全中 spec §8**：floor 5.27（spec≈5.3）、oracle 8.95（spec≈9.1）、RR 4.11≤floor ✓
+
+**🔧 scripts/train_reproduce.py（2026-06-10）**：spec §6.1 RL + §6.2 BC 資料管線。per-cell scalar squashed-Gaussian、UE-embed→segment-mean pool→head、shared/separate actor 變體、per-cell z_i（mean-pool exclude-self encoder）、twin-Q(share⊕joint_a⊕onehot, 不吃z)、sequential HAML update（隨機順序、只有 agent i 的 action 帶梯度、已更新者 resample+detach）、γ=0（y=r 無 bootstrap）、auto-α target H=−1、running-std reward norm。Smoke 通過（floor 5.15/ceiling 8.42）。
+
+**✅ rep_hasac × 3 + rep_chasac × 3 完成（2026-06-10 08:10）**：canonical comparison（separate actors + team reward + fixed topology, 40k steps, γ=0）。floor=5.147 / ceiling=8.417（eval seeds 20000+）：
+
+| seed | HASAC goodput（%gap） | C-HASAC goodput（%gap） |
+|------|----------------------|------------------------|
+| 0 | 6.204（32.3%） | 6.219（32.8%） |
+| 1 | 6.101（29.2%） | 6.401（38.4%） |
+| 2 | 6.189（31.9%） | 5.974（25.3%） |
+| **mean±std** | **6.165±0.046（31.1%±1.4）** | **6.198±0.175（32.2%±5.4）** |
+
+- **✅ z null 跨 3 seeds 成立**：C-HASAC 32.2%±5.4 vs HASAC 31.1%±1.4，完全重疊（差 1.1pp << C-HASAC 的 std 5.4pp）。spec 第一個 headline claim（z-as-input 無效）復現成功。
+- **⚠️ %gap ~31% vs spec 預期 ~48%**：差距跨 seed 穩定存在。觀察：alpha 在 25k 後崩到 0.0005-0.0008（pure HASAC 按 spec 不加 α floor），且多數 run 在 40k 時 goodput 仍在上升（s2 chasac 40k 仍 +28.1% 爬升中）→ 兩個假說：(a) spec 的 48% 用了它提到的 stability 選項（α floor + act_reg）；(b) 40k 不夠長。
+- 訓練全程無崩潰：γ=0（無 bootstrap）下不存在 Q 累積過估，曲線單調爬升，與 chasac 線的震盪形成鮮明對比。
+
+**❌ rep_hasac_stab × 3 seeds 完成（假說 a 否定）**：canonical + `--alpha_min 0.005 --act_reg 0.001` → **14.2% ± 1.3**（12.7/15.9/13.9），比 pure 的 31.1% 砍半。α floor 0.005 把 policy 鎖在過高隨機性，擋住收斂到 spatial-reuse 解。**spec 的 48% 不是來自 stability 選項。**
+- **重要反差結論**：α-floor 在 reproduce env（γ=0 bandit，無 Q 累積過估）**有害**、在 chasac env（γ=0.99 bootstrap）**救命**——entropy guard 的價值完全取決於 Q 是否會 bootstrap 累積過估。
+
+**✅ rep_hasac_120k × 2 完成（假說 b 也否定）**：s0=36.1%、s1=32.8% → **34.5% ± 1.7**。長訓只比 40k（31.1%）+3.4pp，且 67.5k 後幾乎零增益 → **平台確認 ~35%，到不了 48%**。
+- **48% 之謎結案傾向**：兩個假說皆否。最合理解釋 = spec 自註 "exact values depend on topo_seed"——同 seed 但不同程式碼的 RNG 抽樣順序產生不同幾何配置，RL 平台高度 topology-dependent。floor/ceiling 精準對上、全部 qualitative claims 成立，視為合格復現。
+
+**✅ rep_hasac_randtopo × 3 完成（claim #2 成立）**：random topology 下 HASAC RL = **−23.0 / −3.6 / +2.0 % → ≈ 0%（floor 水準）**（random topo 的 floor=10.945 較高，因每 trial 重抽配置）。**對照 fixed topology 的 31.1% → spec claim #2（RL 只能學 topology-specific 的 spatial reuse，無法跨拓撲泛化）復現成立** ✓
+
+**fix1 暫停（2026-06-10 10:00，群組指示）**：@615k，best −2.772 ckpt 存檔。n-step A/B 結論成立：fix3（n_step=3，best −2.073、全程健康）>> fix1（n_step=1，卡死全功率區）。
+
+**✅ chasac_fix3 FINAL（1200k，2026-06-10 14:00）**：done-mask + n_step=3 + alpha_min=0.001 + EMA + top-10 validation 重排序。
+- **FINAL policy = −2.223 ± 3.203**（validation 選出 step 210k ckpt，val −2.617）
+- drop_zero = **+8.071**（z←0 直接毀掉 policy）、drop_shuffle = +0.342（z 多為 offset 用法）
+- **未突破 +0.808**。但選擇機制驗證成功：train best −2.073 → FINAL −2.223（縮水僅 0.15）vs 舊 alpha_fix_800k 的 +2.575 → +0.808（縮水 1.77）——**re-ranking 讓報告數字誠實了，代價是失去舊 run 靠高變異震盪+運氣選擇撈到的高峰**
+- 誠實解讀：+0.808 來自「高變異 regime 偶發好策略 + 5-ep 噪音選擇撿到」；修正 Q target 正確性（done-mask）+ 穩定化後，真實的穩定水準是 −2.2 一帶。舊 +0.808 作為 policy artifact 仍有效（eval 不受訓練 bug 影響），但其產生過程不可複製
+- 可能的下一步（若還要衝分）：保留 done-mask + topK validation（正確性+誠實選擇），拿掉壓變異的元件（alpha_min、n_step=3），用 800k+ 讓高峰自然出現、由 validation 誠實收割
+
+**🔧 train_reproduce.py：--mode combine（2026-06-10）**：claim #3 實作。combine MLP 以 uniform (z,b) pairs BC 成乘法器並在 101×101 grid 驗證（MAE/corr）；wire `power=combine(gate,base)`；SAC RL-refine（γ=0、所有 wired 元件可訓練，fixed 變體乘法不可訓練）。
+- **Smoke 即重現退化**：multiplier 驗證 **corr=0.99826**（spec 寫 "corr≈0.998"，分毫不差）；wired BC=40.1%；**RL 僅 1000 步 → −11.0%（跌破 floor），乘法器 MAE 0.0076→0.058** = "RL un-learns the multiplier" 即時重現
+- **✅ 第一輪 40k 對照（全元件可訓練）完成——比 spec 更強的負面結論**：
+  - rep_combine_learn：wired BC 40.1% → RL **15.8%**（multiplier 被拆）
+  - rep_combine_fixed：wired BC 68.7% → RL **7.1%**（**連固定乘法臂也崩！**）
+  - 解讀：spec 的 hold-arm 寫的是「oracle gate」= **gate 凍結**、RL 只訓練 worker/base。我們第一輪讓 RL 連 gate 都能動 → RL 把幾何 gate 本身拆了。**「RL un-learns」的範圍比 spec 寫的更廣：不只 learnable combine，連 BC 好的 gate 网路都會被毀。**
+- **❌ freeze_gate 版也崩（68.7%→7.1% / 40.1%→−8.1%）→ 診斷出第一代 refine 機制的 atanh 飽和缺陷**：我用 `atanh(2L−1)` 把 wired level 轉回 μ，但 spatial gate 壓近 0 的 cell → μ≈−3.5 起跳就在 tanh 飽和區（−165 老問題重演）。第一代 4 條 refine run 全部作廢（機制缺陷，非 spec 的現象）。
+- **🔧 RL 段重寫（spec 構造，2026-06-10）**：worker 從零訓練的 squashed-Gaussian SAC actor；**gate 乘在 squash 之外**（`applied = gate(o)×(a+1)/2`，無 atanh）；critic 吃 applied joint levels；degrade 臂 `applied = combine(gate, base)`，combine 由 RL 梯度訓練。Smoke 3k 步健康爬到 39.6%（無飽和）✓
+- **✅ rep_worker_fixed + rep_worker_learn 完成（claim #3 完整復現，2026-06-10）**：
+
+  | 臂 | 乘法 | FINAL %gap | multiplier corr |
+  |----|------|-----------|----------------|
+  | **fixed**（hold） | 硬接線 | **71.6%**（≥ wired BC 68.7%）| — |
+  | **learnable**（degrade） | NN（BC 至 corr 0.998） | **38.7%** | **0.9983 → 0.1006（被 RL 徹底拆掉）** |
+
+  - 同樣的 RL、同樣的凍結 gate，唯一差別 = 乘法可不可學 → 33pp 差距
+  - 機制全程可見：corr 軌跡 0.998（5k）→ 0.10（35k），RL 把驗證過的乘法器完全 un-learn
+  - **三大 claims 全部復現完成**：#1 z null ✓、#2 fixed >> random ✓、#3 RL un-learns learnable combine、只有固定乘法存活 ✓
+- **群組確認 config**：regime = full-buffer + fading ✓（與我們一致，bursty 否定吻合）；精確常數 N0=7.166e-16 W（熱雜訊 −174+10log(180kHz)）、Pmax=3.162e-5 W；幾何 dump `geom_topo12345.npz` 等上傳（env 已支援 `--geom_file` 直接載入 g_ls/serv/bs/ue/N0/Pmax，跳過本地 RNG）。作者證實我們的診斷：draw-order 不同 → 同 seed 不同幾何 → 我們的幾何 spatial 成分只有 69%（他們 ~80%）。
+- **❌ rep_gate_bursty 完成（bursty 假說否定）**：bursty regime 下 gate×base 只有 **17.7%**（floor 5.068）。bursty 使 spatial oracle 變時變函數（gate MSE 0.035 非 full-buffer 的 0），從 local obs BC 更難。**full-buffer 是正確 regime**；69.8% vs 80-95% 的剩餘差異鎖定幾何配置（等 g_ls dump 驗證）。
+- **群組提供 80-85% 配方對照**：兩邊 recipe 完全一致；floor/ceiling 不同（5.33/9.09 vs 我們 5.15/8.42）→ 同 topo_seed 但 RNG 順序不同 = 幾何不同。已向群組要 g_ls/座標 dump 以在同幾何對數。
+
+**🔧 train_reproduce.py：gate×base 模式（--mode gate，2026-06-10）**：spec §3.4/§5/§6.3 實作。`CellNet`（UE-embed→pool→head→sigmoid）per-cell gate/base 各 N_BS 個獨立網路；dataset 沿 full-oracle 軌跡同時記錄 full level 和 spatial level；gate→spatial oracle（MSE）、base→residual `clip(full/spatial,0,1)`（spatial=0 時 base=1）；**固定乘法** `power=gate×base`。
+- **Smoke（4 trials, 300 iters）→ 71.1% of gap（goodput 7.47）**：已是 RL（31%）兩倍以上，spec 80-85% 主張方向確認 ✓
+
+**✅ rep_gate × 3 seeds 完成（2026-06-10）**：60 trials dataset（9000 samples）+ 3000 iters：
+- s0=7.423（69.6%）、s1=7.432（69.9%）、s2=7.433（69.9%）→ **69.8% ± 0.2**（對 init seed 完全不敏感）
+- **gate MSE → 0.00000**：固定 topology + 飽和 queue 下 spatial oracle 對每 cell ≈ 常數 → gate 學到的就是 spec 所說「fixed geometric role」
+- **qualitative 結論成立：gate×base BC（69.8%）>> RL（31.1%）**，方向與 spec 一致；絕對值略低於 spec 的 80-85%（eval std ±0.69 下與 80% 有部分重疊）
+- **rep_gate_big 完成**：hidden 512 + 10000 iters → **70.2%**（僅 +0.4pp）→ 瓶頸非容量
+- **🔬 診斷（spatial-oracle-as-policy）**：spatial oracle 單獨當 policy = **69.0%** ≈ gate×base 的 69.8-70.2% → **我們的 70% 幾乎全來自幾何（slow gate）**；fast fading 適應的 31pp 空間中 base net 只撈回 ~1pp。spec 的 80-85% 意味其 base 從 local obs 恢復了 ~1/3 fading 適應——此為與 spec 的真正差異點（部分可觀測性利用程度），非 bug。gate 臂收尾，絕對值差異記為 caveat，qualitative 結論（BC gate >> RL）穩固成立。
 
 ---
+
+**專案方向（確認）**：比較 **vanilla HASAC（無 z）** vs **C-HASAC（有 z）**，唯一差別 = actor 有沒有吃 KPM encoder 學出的 latent context z。
+
+**🔧 train_chasac.py：加入 N-step returns（--n_step，2026-06-10）**：`NStepBuffer` class 累積 n 個 transition，輸出 n-step discounted return（$R_n = \sum_{k=0}^{n-1} \gamma^k r_k$）和第 n 步的 next state。critic update 改用 `gamma^n` 做 bootstrap（`gamma_n = args.gamma ** args.n_step`）。episode 結束時 flush 剩餘 transition（截斷版 n-step）。`--n_step 1` 等同原始 1-step SAC（預設值，向後相容）。動機：n-step returns 提供更準確的 Q target，減少 Q 過估，預期降低 oscillation 頻率、縮小 FINAL 分數與 training peak 之間的差距。Smoke test 通過（n_step=3，FINAL −3.164）。
+
+**🔧 train_chasac.py：穩定性修正包（done-mask / alpha_min / EMA / top-K validation，2026-06-10）**：重新分析 peak(+2.575) vs FINAL(+0.808) 差距後，鎖定三個獨立病灶並各自修正：
+
+1. **done-mask 修正（正確性 bug）**：`Replay` 原本完全沒有 done flag，critic target `r + γ·Q(s')` 無條件跨 episode bootstrap。但 ep_len=10、PF 權重 reset 歸零 → **10% transitions 的 Q target 系統性高估**（episode 末狀態被當成「還有未來」），直接餵養 Q-overestimation。修正：Replay 加 `done` 欄位，target 改 `r + γⁿ·(1−done)·(Q−α·logp)`。n-step flush 的截斷 transition 全部 done=1（natural 終止），γⁿ mismatch 自然消除。
+2. **`--alpha_min`（entropy floor）**：翻歷史 log 發現死亡區明確——崩死的 run alpha 都在 0.0005–0.0007，成功的 run 停在 0.0015+。`--alpha_min 0.001` 擋死亡區、不干擾成功區（與 mu_bound 同精神的數值 guard）。
+3. **`--ema_decay`（EMA/Polyak 部署副本）**：維護 actor/encoder 權重移動平均（0.9999 ≈ 10k-step 窗口），eval 時兩份都評，把「深崩→反彈」震盪平均掉。不改訓練本身。
+4. **`--topk` + validation 重排序**：原本只留單一 best ckpt 且用高噪音訓練 eval 選（噪音峰被選中→FINAL 縮水）；且訓練 eval 與 FINAL 同用 seed=2024（前 20 scenario 重疊=輕微測試污染）。修正：保留 top-10 ckpts（raw+ema），訓練結束在獨立 validation seed=5151 上各跑 50-ep 重排序，選出真冠軍後才報 test 分數。Smoke test 即展示效果：train_U −2.878 的 ckpt 在 val 上只剩 −3.620。
+
+以上全部與 HASAC 演算法核心（sequential update / twin-Q / auto-alpha）正交，也不動資訊分流（deployment line 不變）。Smoke test 全過。
+
+**🔧 train_chasac.py：第二波 anti-overestimation 工具（已實作待跑，2026-06-10）**：針對 Q-overestimation 再加兩個合規方法 + 診斷：
+1. **`--actor_every K`（delayed policy update，TD3 式）**：actor/alpha/encoder 每 K 個 critic step 才更新一輪。動機：sequential loop 讓 actor 每 step 做 3 次 backward vs critic 1 次（3:1），actor exploit Q 的速度快過 Q 自我修正；K=3 把比例反轉成 1:1。HASAC 論文只規定 permutation 順序逐 agent 更新，未規定每 env step 都要做，合規。
+2. **`--q_clamp X`**：critic target clip 到 [−X, X]。logpf per-BS episodic return 理論值域 ~[−20, +30]（第一步 R̄ 從 0 跳起貢獻最大），超出範圍的 target 必為噪音。建議 X=50（寬鬆保險）。
+3. **Q 診斷欄**：eval log 加 `Q mean/max`（critic 對 batch 的估值），之後可直接從 log 觀察 overestimation 發生時點。smoke 實測 Q mean 3.7 / max 16.2，落在理論值域內。
+- Smoke test 全過；**EMA ckpt 首次在 validation re-rank 勝出**（val −3.324 > 所有 raw），證明 EMA 機制有效。
+- 待 fix1/fix3 跑完後啟動 `--actor_every 3 --q_clamp 50` 的對照 run。
+
+**🆕 chasac_fix1 + chasac_fix3（2026-06-10，進行中）**：目標突破 alpha_fix_800k 的 FINAL +0.808。
+- **chasac_fix1**（PID 652976）：n_step=1 + done-mask + alpha_min=0.001 + ema_decay=0.9999 + topk=10，tau=0.001，logpf+bc1000+mu_bound5，1200k
+- **chasac_fix3**（PID 652977）：同上但 n_step=3（A/B 測 n-step returns）
+- 取代先前的 chasac_nstep3/chasac_long1200k（70k 時砍掉重啟：舊版缺 done-mask，跑滿參考價值有限；當時兩者 best −3.686 / −3.629 並駕齊驅，nstep3 的 alpha 維持較高 0.07 vs 0.05）
+
+**⚠️ 架構修正（2026-06-09）**：原 train_chasac.py 使用 parameter-shared actor（3 BS 共用一組參數），違反 HASAC 論文的 per-agent separate policies 設計。已新增 `scripts/train_hasac.py`，完全按照論文：3 個獨立 actor、sequential update 只更新 π^i、無 BC/mu_bound/oracle_z。
+
+**🆕 hasac_clean（完全按照論文，早停 30k，2026-06-09）**：`scripts/train_hasac.py`，3 個獨立 actor，sequential update，無任何工程修正（無 mu_bound、無 BC、alpha_init=0.2）。
+- best = **−5.810**（step 10k，僅高出 floor 0.478）；step 30k：**−165.786 ± 0.000**（完全飽和死鎖，kill）
+- **結論：separate policies 版本同樣因 tanh 飽和崩潰**。無 mu_bound 的 SAC 在 logpf reward 下，power→0 → log(0+ε) ≈ −14/UE → 12 UE 合計 ≈ −168，正反饋把 μ 推向 −∞，alpha 崩到 0.0005（entropy 死），step 30k 完全塌縮無恢復可能。
+- **mu_bound 是我們 5G 環境（log reward + tanh action）的數值必要條件，非 HASAC 演算法本身的要求**，separate policies 不能解決這個問題。
+
+**🔧 env_chasac.py + train_chasac.py：UE randomwalk + 固定 BS（2026-06-09）**：
+- `Cfg.walk_speed`（default=0）：> 0 時啟用 UE randomwalk（m/step），BS 在 `Env.__init__` 固定，不隨 `reset()` 改變
+- `_channel_from_positions(cfg, bs, ue, rng)`：從現有 BS/UE 位置重算 channel，`_associate(g, cfg)` 確保每 BS 至少 1 UE
+- `Env.step()` 尾端：若 walk_speed > 0，UE += N(0, walk_speed)（clip 到 area），重算 g 和 serv
+- `train_chasac.py` 加 `--walk_speed`，傳入 cfg
+- Smoke test 通過（walk_speed=5.0，FINAL policy=-2.985）
+
+**🆕 UE randomwalk 對照 run（200k，2026-06-09，進行中）**：
+- **hasac_walk5_z0**（PID 589249）：use_z=0，walk_speed=5，HASAC baseline
+- **chasac_walk5_z1**（PID 589250）：use_z=1，walk_speed=5，C-HASAC with z
+- 同設定：logpf + bc1000 + mu_bound=5 + warmup=1000
+- 對比問題：動態 channel 下 z 是否更有用（drop_shuffle 是否提升）
+
+**🔧 train_hasac.py：加入 `--mu_bound` 支援（2026-06-09）**：群組確認「這個可以加，請加上簡單的小 fix」。`Actor.forward` 加入 `if mu_bound > 0: mu = mu_bound * tanh(mu_raw)`，與 train_chasac.py 完全一致。argparse 加 `--mu_bound`（default=0.0），log header 顯示設定值。
+
+**🆕 hasac_sep_mub（separate policies + mu_bound=5，早停 50k，2026-06-09）**：`scripts/train_hasac.py --reward logpf --mu_bound 5 --warmup 1000`。
+- best = **−5.651**（step 5k），alpha step 15k 就崩到 0.003，step 20k 後卡死在 0.0007，50k 步無改善
+- mu_bound 防止 −165 崩潰（比 hasac_clean 好），但 alpha 仍然過快死亡 → policy 卡在 −5 附近震盪
+- **根因**：separate policies + sequential update + default tau=0.005 → entropy 不穩定快速崩潰。在 train_chasac.py 裡同樣問題靠 tau=0.001 解決（chasac_tau001：policy −1.051）
+- 結論：需再加 `--tau 0.001` 才能讓 separate-policy HASAC 穩定訓練
+
+---
+
+**🔧 train_chasac.py：加入 `--oracle_z 1` flag（2026-06-09）**：`pf_wsr_ceiling` 的 per-BS power fractions 直接作為 z 餵給 actor（繞過 encoder）。z_dim=N_BS=3，kpm field 改存 oracle power，eval/shuffle_z ablation 全部支援。新增 `--oracle_grid 3`（訓練用快速近似 27 combos）vs cfg.ceiling_grid=6（eval 精確版）。BC warm-start 支援 oracle_z 模式（bc_dataset_oracle.npz 快取）。
+
+**🆕 chasac_oracle_z（no-BC，200k，2026-06-09，進行中）**：`--oracle_z 1 --reward logpf --mu_bound 5 --warmup 1000`。
+- step 55k/200k：best = **−4.896**，alpha ≈ 0.0007（entropy 崩潰），policy 在 −5 上下震盪
+- 結論（初步）：**無 BC 的 oracle_z 學不會用 z**，再次驗證 BC warm-start 是打開 z 使用的關鍵
+
+**🆕 chasac_oracle_z_bc（BC 1000 steps，早停 35k，2026-06-09）**：`--oracle_z 1 --oracle_grid 3 --bc_steps 1000 --reward logpf --mu_bound 5 --warmup 1000`。BC MSE 0.057（收斂），35k 後崩潰，best checkpoint (step 15k) 手動 FINAL eval（50 eps）：
+- FINAL policy = **−4.673** ± 2.929（僅高出 floor 0.66，遠遜於 C-HASAC −2.237）
+- drop_zero = **−0.066**（z←0 反而更好！）
+- drop_shuffle = **+0.059**（≈ 0，oracle z 幾乎未被使用）
+- 結論：**oracle z（per-BS power fracs）作為協調訊號無效**。per-BS power fracs ≈ 常數 ~5%，低變異度，actor 無法從中提取條件性資訊。Encoder 非 bottleneck：learned z [16] 之所以有效，是因為編碼了「誰是主 BS / 干擾結構」等相對協調情境，而非目標功率水準。
+
+---
+
+**📦 GitHub push（2026-06-09）**：將 C-HASAC 核心程式碼推至 https://github.com/redycc/cchasac-5g.git（commit 78f4bfd）。包含 env_chasac.py、train_chasac.py、analyze_z.py、plot_z_analysis.py、poster/、logo/、HANDOFF_CHASAC_IMPL.md 等 40 個檔案。已排除 results/、telegram secrets。
 
 **🆕 chasac_pbs（per-BS z，200k，2026-06-09）**：`--remove_own_kpm 1`，每個 BS i 只吃鄰居 KPM → 各自的 z_i [16]。
 - FINAL policy = **−2.694** ± 4.934（優於 global-z 的 −3.207）

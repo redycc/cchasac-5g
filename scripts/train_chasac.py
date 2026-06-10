@@ -19,7 +19,7 @@ reward / critic / 演算法 / 超參完全一致 (HANDOFF 原則 #7).
   python scripts/train_chasac.py --use_z 0 --steps 100000 --tag hasac
   python scripts/train_chasac.py --use_z 1 --steps 100000 --tag chasac
 """
-import os, sys, time, argparse
+import os, sys, time, argparse, copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -165,12 +165,14 @@ class Replay:
         self.nmask = np.zeros_like(self.mask)
         self.nkpm = np.zeros_like(self.kpm)
         self.nsh = np.zeros_like(self.sh)
+        self.d   = np.zeros((cap,), np.float32)   # done: episode boundary, no bootstrap
 
-    def add(self, o, mask, kpm, sh, a, r, no, nmask, nkpm, nsh):
+    def add(self, o, mask, kpm, sh, a, r, no, nmask, nkpm, nsh, done):
         i = self.ptr
         self.o[i], self.mask[i], self.kpm[i], self.sh[i] = o, mask, kpm, sh
         self.a[i], self.r[i] = a, r
         self.no[i], self.nmask[i], self.nkpm[i], self.nsh[i] = no, nmask, nkpm, nsh
+        self.d[i] = done
         self.ptr = (self.ptr + 1) % self.cap
         self.size = min(self.size + 1, self.cap)
 
@@ -178,7 +180,44 @@ class Replay:
         idx = np.random.randint(0, self.size, size=bs)
         t = lambda x: torch.as_tensor(x[idx], device=DEVICE)
         return (t(self.o), t(self.mask), t(self.kpm), t(self.sh), t(self.a),
-                t(self.r), t(self.no), t(self.nmask), t(self.nkpm), t(self.nsh))
+                t(self.r), t(self.no), t(self.nmask), t(self.nkpm), t(self.nsh),
+                t(self.d))
+
+
+class NStepBuffer:
+    """Accumulates n transitions and computes n-step discounted returns before adding to Replay.
+    At episode boundary call flush() to drain remaining transitions with truncated returns."""
+    def __init__(self, n, gamma, n_bs):
+        self.n = n
+        self.gamma = gamma
+        self.n_bs = n_bs
+        self.buf = []  # list of (o, mask, kpm, sh, a, r, no, nmask, nkpm, nsh)
+
+    def _make_transition(self, start, end):
+        o, mask, kpm, sh, a = self.buf[start][:5]
+        no, nmask, nkpm, nsh = self.buf[end - 1][6:10]
+        done = self.buf[end - 1][10]
+        r_n = np.zeros(self.n_bs, np.float32)
+        for k in range(end - start):
+            r_n += (self.gamma ** k) * self.buf[start + k][5]
+        return (o, mask, kpm, sh, a, r_n, no, nmask, nkpm, nsh, done)
+
+    def add(self, transition):
+        """Add one transition; returns a ready (n-step) transition or None."""
+        self.buf.append(transition)
+        if len(self.buf) >= self.n:
+            t = self._make_transition(0, self.n)
+            self.buf.pop(0)
+            return t
+        return None
+
+    def flush(self):
+        """Drain remaining transitions (episode end) with truncated n-step returns."""
+        results = []
+        while self.buf:
+            results.append(self._make_transition(0, len(self.buf)))
+            self.buf.pop(0)
+        return results
 
 
 # --------------------------- helpers ------------------------------
@@ -206,6 +245,15 @@ def build_obs(env, use_rsrp=False):
     return o_full, mask, kpm, share
 
 
+def _oracle_kpm_np(env, cfg, pmax, grid=3):
+    """Per-BS oracle power fractions [N_BS, 1] to store in replay kpm field (oracle_z mode).
+    grid=3 (default) is fast (27 combos); use cfg.ceiling_grid only for final eval."""
+    w = env._weights()
+    p_o = E.pf_wsr_ceiling(env.g, env.serv, w, cfg.N_BS, grid)
+    bs_pwr = np.array([p_o[env.serv == b].sum() for b in range(cfg.N_BS)], np.float32)
+    return (bs_pwr / (pmax + 1e-9))[:, None]  # [N_BS, 1]
+
+
 def action_to_powerlist(a, serv, n_bs, pmax):
     """raw a in (-1,1) -> 每 BS 的 desired power list (env._project 會再投影到 sum<=Pmax)."""
     frac = (a + 1.0) / 2.0                       # [0,1]
@@ -220,15 +268,17 @@ def onehots(n_bs):
 # --------------------------- eval ---------------------------------
 @torch.no_grad()
 def eval_policy(actor, encoder, cfg, n_eval=20, T=10, seed=2024, zero_z=False, shuffle_z=False,
-                use_rsrp=False, remove_own_kpm=False):
+                use_rsrp=False, remove_own_kpm=False, oracle_z=False):
     """canonical PF utility U = Σ_u log(R̄_u); 在 held-out scenarios 上跑 policy."""
     pmax = E.dbm_to_w(cfg.Pmax_dBm)
+    n_bs = cfg.N_BS
     rng = np.random.default_rng(seed)
+    has_z = (encoder is not None) or oracle_z
 
     # Pre-collect z from n_eval DIFFERENT scenarios for shuffle_z.
     # Episode i receives z from scenario (i+1)%n_eval — guaranteed cross-scenario mismatch.
     z_wrong = None
-    if shuffle_z and encoder is not None:
+    if shuffle_z and has_z:
         rng_sh = np.random.default_rng(seed + 54321)
         z_wrong = []
         for _ in range(n_eval):
@@ -236,12 +286,16 @@ def eval_policy(actor, encoder, cfg, n_eval=20, T=10, seed=2024, zero_z=False, s
             env_sh.reset()
             ep_z = []
             for _t in range(T):
-                _, _, kpm_sh, _ = build_obs(env_sh, use_rsrp=use_rsrp)
-                z_sh = encode_kpm(encoder, torch.as_tensor(kpm_sh[None], device=DEVICE),
-                                   cfg.N_BS, remove_own_kpm)
+                if oracle_z:
+                    oz = _oracle_kpm_np(env_sh, cfg, pmax, grid=cfg.ceiling_grid)
+                    z_sh = torch.as_tensor(oz[:, 0][None], device=DEVICE)  # [1, N_BS]
+                else:
+                    _, _, kpm_sh, _ = build_obs(env_sh, use_rsrp=use_rsrp)
+                    z_sh = encode_kpm(encoder, torch.as_tensor(kpm_sh[None], device=DEVICE),
+                                       n_bs, remove_own_kpm)
                 ep_z.append(z_sh.clone())
-                p_eq = E.bl_equal_power(env_sh.g, env_sh.serv, env_sh._weights(), cfg.N_BS)
-                env_sh.step([p_eq[env_sh.serv == i] for i in range(cfg.N_BS)])
+                p_eq = E.bl_equal_power(env_sh.g, env_sh.serv, env_sh._weights(), n_bs)
+                env_sh.step([p_eq[env_sh.serv == i] for i in range(n_bs)])
             z_wrong.append(ep_z)
         z_wrong = z_wrong[1:] + [z_wrong[0]]   # rotate: ep i gets z from scenario (i+1)%n_eval
 
@@ -255,15 +309,19 @@ def eval_policy(actor, encoder, cfg, n_eval=20, T=10, seed=2024, zero_z=False, s
             ot = torch.as_tensor(o[None], device=DEVICE)
             mt = torch.as_tensor(mask[None], device=DEVICE)
             z = None
-            if encoder is not None:
-                z = encode_kpm(encoder, torch.as_tensor(kpm[None], device=DEVICE),
-                                cfg.N_BS, remove_own_kpm)
+            if has_z:
+                if oracle_z:
+                    oz = _oracle_kpm_np(env, cfg, pmax, grid=cfg.ceiling_grid)
+                    z = torch.as_tensor(oz[:, 0][None], device=DEVICE)  # [1, N_BS]
+                else:
+                    z = encode_kpm(encoder, torch.as_tensor(kpm[None], device=DEVICE),
+                                    n_bs, remove_own_kpm)
                 if zero_z:
                     z = torch.zeros_like(z)
                 elif shuffle_z:
                     z = z_wrong[ep_idx][t]
             a = actor.act(ot, mt, z, deterministic=True)[0].cpu().numpy()
-            pl = action_to_powerlist(a, env.serv, cfg.N_BS, pmax)
+            pl = action_to_powerlist(a, env.serv, n_bs, pmax)
             _, _, _, info = env.step(pl)
             rate_sum += info["rate"]
         Us.append(np.log(rate_sum / T + 1e-6).sum())
@@ -271,15 +329,20 @@ def eval_policy(actor, encoder, cfg, n_eval=20, T=10, seed=2024, zero_z=False, s
 
 
 @torch.no_grad()
-def eval_power_frac(actor, encoder, cfg, n=5, T=10, seed=2024, use_rsrp=False, remove_own_kpm=False):
+def eval_power_frac(actor, encoder, cfg, n=5, T=10, seed=2024, use_rsrp=False, remove_own_kpm=False,
+                    oracle_z=False):
     """diagnostic: mean deterministic power fraction (a+1)/2; ~0 => actor saturated to zero-power."""
     pmax = E.dbm_to_w(cfg.Pmax_dBm); rng = np.random.default_rng(seed); fr = []
     for _ in range(n):
         env = E.Env(cfg, reward_mode="difference", seed=int(rng.integers(1 << 30))); env.reset()
         for _t in range(T):
             o, mask, kpm, sh = build_obs(env, use_rsrp=use_rsrp)
-            z = (encode_kpm(encoder, torch.as_tensor(kpm[None], device=DEVICE),
-                            cfg.N_BS, remove_own_kpm) if encoder else None)
+            if oracle_z:
+                oz = _oracle_kpm_np(env, cfg, pmax, grid=cfg.ceiling_grid)
+                z = torch.as_tensor(oz[:, 0][None], device=DEVICE)
+            else:
+                z = (encode_kpm(encoder, torch.as_tensor(kpm[None], device=DEVICE),
+                                cfg.N_BS, remove_own_kpm) if encoder else None)
             a = actor.act(torch.as_tensor(o[None], device=DEVICE),
                           torch.as_tensor(mask[None], device=DEVICE), z, deterministic=True)[0].cpu().numpy()
             fr.append(float(((a + 1.0) / 2.0).mean()))
@@ -307,10 +370,16 @@ def eval_baseline(fn, cfg, n_eval=20, T=10, seed=2024):
 
 
 # --------------------------- BC pretrain --------------------------
-def _bc_dataset(cfg, n_data, logp, seed=777, cache="results/bc_dataset.npz", use_rsrp=False):
-    """一次性生成 BC 資料集 (expert=pf_wsr_ceiling); 依 (cfg, n_data, seed, use_rsrp) 快取到磁碟。"""
+def _bc_dataset(cfg, n_data, logp, seed=777, cache="results/bc_dataset.npz", use_rsrp=False,
+                oracle_z=False):
+    """一次性生成 BC 資料集 (expert=pf_wsr_ceiling); 依 (cfg, n_data, seed, use_rsrp) 快取到磁碟。
+    oracle_z=True: K stores per-BS oracle power fracs [N_BS, 1] instead of KPM [N_BS, kpm_dim]."""
     pmax = E.dbm_to_w(cfg.Pmax_dBm)
-    kpm_dim_now = 3 + cfg.N_BS - 1
+    if oracle_z:
+        cache = cache.replace(".npz", "_oracle.npz")
+        kpm_dim_now = 1
+    else:
+        kpm_dim_now = 3 + cfg.N_BS - 1
     if os.path.exists(cache):
         d = np.load(cache)
         cached_kpm_dim = int(d["kpm_dim"]) if "kpm_dim" in d else 3
@@ -319,7 +388,7 @@ def _bc_dataset(cfg, n_data, logp, seed=777, cache="results/bc_dataset.npz", use
                 and cached_kpm_dim == kpm_dim_now and cached_rsrp == use_rsrp):
             logp(f"[BC] dataset cache hit ({cache}, n={n_data})")
             return d["O"], d["M"], d["K"], d["A"]
-    logp(f"[BC] building dataset n={n_data} (pf_wsr_ceiling expert)...")
+    logp(f"[BC] building dataset n={n_data} (pf_wsr_ceiling expert, oracle_z={oracle_z})...")
     rng = np.random.default_rng(seed)
     O, M, K, A = [], [], [], []
     for _ in range(n_data):
@@ -329,6 +398,9 @@ def _bc_dataset(cfg, n_data, logp, seed=777, cache="results/bc_dataset.npz", use
         p_exp = E.pf_wsr_ceiling(env.g, env.serv, w, cfg.N_BS, cfg.ceiling_grid)
         o, mask, kpm, _ = build_obs(env, use_rsrp=use_rsrp)
         a_exp = np.clip(2.0 * (p_exp / pmax) - 1.0, -0.999, 0.999).astype(np.float32)
+        if oracle_z:
+            bs_pwr = np.array([p_exp[env.serv == b].sum() for b in range(cfg.N_BS)], np.float32)
+            kpm = (bs_pwr / (pmax + 1e-9))[:, None]   # [N_BS, 1] oracle power fracs
         O.append(o); M.append(mask); K.append(kpm); A.append(a_exp)
     O, M, K, A = map(lambda x: np.stack(x).astype(np.float32), (O, M, K, A))
     np.savez(cache, O=O, M=M, K=K, A=A, n_data=n_data, seed=seed,
@@ -409,20 +481,21 @@ def bc_pretrain_critic(critic, critic_t, opt_c, cfg, steps, batch, logp,
 
 
 def bc_pretrain(actor, encoder, params, cfg, steps, batch, lr, logp,
-                n_data=3000, seed=777, use_rsrp=False, remove_own_kpm=False):
+                n_data=3000, seed=777, use_rsrp=False, remove_own_kpm=False, oracle_z=False):
     """
     用 full-CSI PF-WSR ceiling 當 expert, 監督式 warm-start actor (+encoder).
-    obs 取自 reset 狀態 (env.p = equal_power) —— 對應 RL t=0 的決策分布;
-    target = expert 功率經 inverse-projection 成 raw action a∈(-1,1).
-    先一次性生成 n_data 個 expert 樣本 (快取), 再做 steps 次 minibatch SGD。
+    oracle_z=True: use K[:,:,0] as z directly (no encoder); actor learns to map oracle z → expert action.
     """
-    O, M, K, A = _bc_dataset(cfg, n_data, logp, seed=seed, use_rsrp=use_rsrp)
+    O, M, K, A = _bc_dataset(cfg, n_data, logp, seed=seed, use_rsrp=use_rsrp, oracle_z=oracle_z)
     O, M, K, A = (torch.as_tensor(x, device=DEVICE) for x in (O, M, K, A))
     opt = torch.optim.Adam(params, lr=lr)
-    logp(f"[BC] start | steps={steps} batch={batch} n_data={n_data}")
+    logp(f"[BC] start | steps={steps} batch={batch} n_data={n_data} oracle_z={oracle_z}")
     for it in range(1, steps + 1):
         idx = torch.randint(0, O.shape[0], (batch,), device=DEVICE)
-        z = encode_kpm(encoder, K[idx], cfg.N_BS, remove_own_kpm) if encoder else None
+        if oracle_z:
+            z = K[idx][:, :, 0]                        # [B, N_BS] oracle power fracs
+        else:
+            z = encode_kpm(encoder, K[idx], cfg.N_BS, remove_own_kpm) if encoder else None
         mu, _ = actor.forward(O[idx], M[idx], z)
         pred = torch.tanh(mu)                          # deterministic action
         loss = F.mse_loss(pred, A[idx])
@@ -436,13 +509,18 @@ def bc_pretrain(actor, encoder, params, cfg, steps, batch, lr, logp,
 # --------------------------- train --------------------------------
 def train(args):
     cfg = E.Cfg()
+    cfg.walk_speed = args.walk_speed   # UE randomwalk; 0 = static (default)
     pmax = E.dbm_to_w(cfg.Pmax_dBm)
     n_bs, n_ue = cfg.N_BS, cfg.N_UE
     ue_feat = 3 + (cfg.N_BS if args.use_rsrp else 0)   # +N_BS if RSRP_neighbor enabled
     kpm_dim = 3 + cfg.N_BS - 1      # 3 KPM + (N_BS-1) inter-BS distances = 5 for N_BS=3
+    kpm_dim_buf = 1 if args.oracle_z else kpm_dim  # replay buffer kpm field (oracle: 1 float per BS)
     n_bs_pairs = cfg.N_BS * (cfg.N_BS - 1) // 2
     share_dim = n_bs * n_ue + n_ue + n_ue + n_bs_pairs  # g(36)+p(12)+serv(12)+dist(3)=63
-    z_dim = args.z_dim if args.use_z else 0
+    if args.oracle_z:
+        z_dim = n_bs   # oracle z = per-BS power fractions [N_BS]
+    else:
+        z_dim = args.z_dim if args.use_z else 0
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
 
@@ -451,7 +529,7 @@ def train(args):
     critic = Critic(share_dim, n_ue, n_bs, args.hidden, layer_norm=args.critic_ln).to(DEVICE)
     critic_t = Critic(share_dim, n_ue, n_bs, args.hidden, layer_norm=args.critic_ln).to(DEVICE)
     critic_t.load_state_dict(critic.state_dict())
-    encoder = Encoder(kpm_dim, 128, z_dim).to(DEVICE) if args.use_z else None
+    encoder = Encoder(kpm_dim, 128, z_dim).to(DEVICE) if (args.use_z and not args.oracle_z) else None
 
     actor_only_params = list(actor.parameters())
     encoder_params = list(encoder.parameters()) if encoder else []
@@ -463,7 +541,9 @@ def train(args):
     opt_alpha = torch.optim.Adam([log_alpha], lr=args.lr)
     target_H = -float(n_ue) / n_bs                  # per-BS target entropy
 
-    rb = Replay(args.replay, n_ue, n_bs, ue_feat, kpm_dim, share_dim)
+    rb = Replay(args.replay, n_ue, n_bs, ue_feat, kpm_dim_buf, share_dim)
+    nsb = NStepBuffer(args.n_step, args.gamma, n_bs) if args.n_step > 1 else None
+    gamma_n = args.gamma ** args.n_step   # discount for bootstrapped Q target
     OH = onehots(n_bs)                              # [N_BS,N_BS]
     env = E.Env(cfg, reward_mode=args.reward, seed=args.seed)
     env.reset()
@@ -472,15 +552,15 @@ def train(args):
     def logp(*a):
         s = " ".join(str(x) for x in a); print(s); logf.write(s + "\n"); logf.flush()
 
-    logp(f"# C-HASAC train | use_z={args.use_z} reward={args.reward} steps={args.steps} "
-         f"z_dim={z_dim} bc_steps={args.bc_steps} alpha_init={args.alpha_init} device={DEVICE}")
+    logp(f"# C-HASAC train | use_z={args.use_z} oracle_z={args.oracle_z} reward={args.reward} steps={args.steps} "
+         f"z_dim={z_dim} bc_steps={args.bc_steps} alpha_init={args.alpha_init} n_step={args.n_step} device={DEVICE}")
 
     # ---- BC warm-start (expert = PF-WSR full-CSI ceiling) ----
     if args.bc_steps > 0:
         bc_pretrain(actor, encoder, actor_only_params + encoder_params, cfg,
                     args.bc_steps, args.bc_batch, args.bc_lr, logp,
                     n_data=args.bc_data, use_rsrp=args.use_rsrp,
-                    remove_own_kpm=args.remove_own_kpm)
+                    remove_own_kpm=args.remove_own_kpm, oracle_z=args.oracle_z)
 
     # ---- Critic BC warm-start (Monte Carlo returns from expert rollouts) ----
     if args.bc_critic_steps > 0:
@@ -496,10 +576,34 @@ def train(args):
         bc_K = torch.as_tensor(K_, device=DEVICE); bc_A = torch.as_tensor(A_, device=DEVICE)
         logp(f"[BC-REG] anchor on n={bc_O.shape[0]} expert samples | lambda={args.bc_reg}")
 
+    # ---- EMA (Polyak-averaged) deployment copy of actor/encoder ----
+    ema_actor = ema_encoder = None
+    if args.ema_decay > 0:
+        ema_actor = copy.deepcopy(actor)
+        for p in ema_actor.parameters():
+            p.requires_grad_(False)
+        if encoder is not None:
+            ema_encoder = copy.deepcopy(encoder)
+            for p in ema_encoder.parameters():
+                p.requires_grad_(False)
+
+    # ---- top-K checkpoint pool; FINAL re-ranks on a held-out validation seed ----
+    best_pool = []
+    def pool_push(U_, step_, src, actor_m, enc_m):
+        if args.topk <= 0:
+            return
+        sd_a = {k: v.detach().cpu().clone() for k, v in actor_m.state_dict().items()}
+        sd_e = ({k: v.detach().cpu().clone() for k, v in enc_m.state_dict().items()}
+                if enc_m is not None else None)
+        best_pool.append(dict(U=U_, step=step_, src=src, actor=sd_a, enc=sd_e))
+        best_pool.sort(key=lambda c: -c["U"])
+        del best_pool[args.topk:]
+
     best_U, best_state = -1e9, None
     t0 = time.time()
     ep_len = args.ep_len
     r_sq_ema = 1.0          # running E[r^2] for optional reward normalization
+    q_dbg_mean = q_dbg_max = 0.0   # critic Q diagnostics for eval log
     for step in range(1, args.steps + 1):
         # curriculum: isolated pretrain phase (no inter-cell interference)
         if args.isolate_pretrain_steps > 0:
@@ -508,13 +612,18 @@ def train(args):
             if was_isolated and not env.isolated:
                 logp(f"[curriculum] step {step}: switching to full interference (isolate phase done)")
         o, mask, kpm, sh = build_obs(env, use_rsrp=args.use_rsrp)
+        if args.oracle_z:
+            kpm = _oracle_kpm_np(env, cfg, pmax, grid=args.oracle_grid)   # [N_BS, 1] oracle power fracs
         if step < args.warmup:
             a = np.random.uniform(-1, 1, size=n_ue).astype(np.float32)
         else:
             ot = torch.as_tensor(o[None], device=DEVICE)
             mt = torch.as_tensor(mask[None], device=DEVICE)
-            z = (encode_kpm(encoder, torch.as_tensor(kpm[None], device=DEVICE),
-                             n_bs, args.remove_own_kpm) if encoder else None)
+            if args.oracle_z:
+                z = torch.as_tensor(kpm[:, 0][None], device=DEVICE)   # [1, N_BS]
+            else:
+                z = (encode_kpm(encoder, torch.as_tensor(kpm[None], device=DEVICE),
+                                 n_bs, args.remove_own_kpm) if encoder else None)
             a = actor.act(ot, mt, z, deterministic=False)[0].cpu().numpy().astype(np.float32)
 
         pl = action_to_powerlist(a, env.serv, n_bs, pmax)
@@ -526,95 +635,139 @@ def train(args):
             r_sq_ema = 0.999 * r_sq_ema + 0.001 * float(np.mean(r ** 2))
             r = np.clip(r / (np.sqrt(r_sq_ema) + 1e-8), -10.0, 10.0)
         no, nmask, nkpm, nsh = build_obs(env, use_rsrp=args.use_rsrp)
-        rb.add(o, mask, kpm, sh, a, r.astype(np.float32), no, nmask, nkpm, nsh)
+        if args.oracle_z:
+            nkpm = _oracle_kpm_np(env, cfg, pmax, grid=args.oracle_grid)  # [N_BS, 1] oracle for next state
+        done = 1.0 if step % ep_len == 0 else 0.0   # episode boundary: PF weights reset, no future
+        transition = (o, mask, kpm, sh, a, r.astype(np.float32), no, nmask, nkpm, nsh, done)
+        if nsb is not None:
+            t = nsb.add(transition)
+            if t is not None:
+                rb.add(*t)
+        else:
+            rb.add(*transition)
 
         if step % ep_len == 0:
+            if nsb is not None:
+                for t in nsb.flush():
+                    rb.add(*t)
             env.reset()
 
         # ---- updates ----
         if rb.size >= args.batch and step >= args.warmup:
-            o_, m_, k_, s_, a_, r_, no_, nm_, nk_, ns_ = rb.sample(args.batch)
+            o_, m_, k_, s_, a_, r_, no_, nm_, nk_, ns_, d_ = rb.sample(args.batch)
             alpha = log_alpha.exp().detach()
             B = o_.shape[0]
 
             # ---- critic (args.critic_updates steps; resample each pass) ----
             for _cu in range(args.critic_updates):
                 if _cu > 0:
-                    o_, m_, k_, s_, a_, r_, no_, nm_, nk_, ns_ = rb.sample(args.batch)
+                    o_, m_, k_, s_, a_, r_, no_, nm_, nk_, ns_, d_ = rb.sample(args.batch)
                     B = o_.shape[0]
                 with torch.no_grad():
-                    nz = encode_kpm(encoder, nk_, n_bs, args.remove_own_kpm) if encoder else None
+                    if args.oracle_z:
+                        nz = nk_[:, :, 0]   # [B, N_BS] oracle power fracs
+                    else:
+                        nz = encode_kpm(encoder, nk_, n_bs, args.remove_own_kpm) if encoder else None
                     na, nlogp = actor.sample(no_, nm_, nz)     # na:[B,N_UE], nlogp:[B,N_BS]
                     yq = []
                     for i in range(n_bs):
                         oh = OH[i][None].expand(B, -1)
                         q1, q2 = critic_t(ns_, na, oh)
                         qmin = torch.min(q1, q2)
-                        yq.append(r_[:, i] + args.gamma * (qmin - alpha * nlogp[:, i]))
+                        yq.append(r_[:, i] + gamma_n * (1.0 - d_) * (qmin - alpha * nlogp[:, i]))
                     y = torch.stack(yq, dim=1)                  # [B,N_BS]
+                    if args.q_clamp > 0:   # logpf per-BS return is bounded; out-of-range targets are noise
+                        y = y.clamp(-args.q_clamp, args.q_clamp)
                 loss_c = 0.0
                 for i in range(n_bs):
                     oh = OH[i][None].expand(B, -1)
                     q1, q2 = critic(s_, a_, oh)
                     loss_c = loss_c + F.mse_loss(q1, y[:, i]) + F.mse_loss(q2, y[:, i])
+                q_dbg_mean, q_dbg_max = float(q1.mean()), float(q1.max())   # diagnostic for eval log
                 opt_c.zero_grad(); loss_c.backward()
                 nn.utils.clip_grad_norm_(critic.parameters(), 10.0)
                 opt_c.step()
 
             # ---- actor: Sequential Soft Policy Decomposition (HASAC §3.3) ----
+            # delayed policy update (TD3-style): actor/alpha/encoder only every actor_every
+            # critic steps — sequential loop gives actor 3 backwards/step vs critic 1,
+            # letting actor exploit Q faster than Q corrects.
             # z is FROZEN (detached) during sequential loop so encoder gets one consistent
             # gradient signal after all agents update, not N_BS conflicting signals.
-            z_frozen = encode_kpm(encoder, k_, n_bs, args.remove_own_kpm) if encoder else None
-            if z_frozen is not None:
-                z_frozen = z_frozen.detach()
-            logp_all_ordered = [None] * n_bs
-            for i in torch.randperm(n_bs).tolist():
-                pa, plogp = actor.sample(o_, m_, z_frozen)   # re-sample with current policy
-                oh = OH[i][None].expand(B, -1)
-                q1, q2 = critic(s_, pa, oh)
-                qmin = torch.min(q1, q2)
-                loss_i = (alpha * plogp[:, i] - qmin).mean()
-                # TD3+BC anchor per agent (z also frozen for BC)
-                if args.bc_reg > 0:
-                    bidx = torch.randint(0, bc_O.shape[0], (B,), device=DEVICE)
-                    zb = encode_kpm(encoder, bc_K[bidx], n_bs, args.remove_own_kpm) if encoder else None
-                    if zb is not None:
-                        zb = zb.detach()
-                    mub, _ = actor.forward(bc_O[bidx], bc_M[bidx], zb)
-                    loss_i = loss_i + args.bc_reg * F.mse_loss(torch.tanh(mub), bc_A[bidx])
-                opt_a.zero_grad(); loss_i.backward()
-                nn.utils.clip_grad_norm_(actor_only_params, 10.0)
-                opt_a.step()
-                logp_i = plogp[:, i].detach()
-                logp_all_ordered[i] = logp_i
-            # ---- alpha: ONE update per RL step (avg logp across all agents) ----
-            avg_logp = torch.stack(logp_all_ordered, dim=1).mean(dim=1)  # [B]
-            loss_alpha = -(log_alpha * (avg_logp + target_H)).mean()
-            opt_alpha.zero_grad(); loss_alpha.backward(); opt_alpha.step()
-            alpha = log_alpha.exp().detach()
-            # ---- encoder: one joint update after all agents (live z, combined loss) ----
-            if encoder:
-                z_live = encode_kpm(encoder, k_, n_bs, args.remove_own_kpm)
-                pa_e, plogp_e = actor.sample(o_, m_, z_live)
-                loss_enc = 0.0
-                for i in range(n_bs):
+            if step % args.actor_every == 0:
+                if args.oracle_z:
+                    z_frozen = k_[:, :, 0]   # [B, N_BS] — no encoder, no gradient needed
+                elif encoder:
+                    z_frozen = encode_kpm(encoder, k_, n_bs, args.remove_own_kpm).detach()
+                else:
+                    z_frozen = None
+                logp_all_ordered = [None] * n_bs
+                for i in torch.randperm(n_bs).tolist():
+                    pa, plogp = actor.sample(o_, m_, z_frozen)   # re-sample with current policy
                     oh = OH[i][None].expand(B, -1)
-                    q1, q2 = critic(s_, pa_e, oh)
-                    loss_enc = loss_enc + (alpha * plogp_e[:, i] - torch.min(q1, q2)).mean()
-                opt_a.zero_grad(); opt_enc.zero_grad(); loss_enc.backward()
-                nn.utils.clip_grad_norm_(actor_only_params, 10.0)
-                nn.utils.clip_grad_norm_(encoder_params, 10.0)
-                opt_a.step(); opt_enc.step()
+                    q1, q2 = critic(s_, pa, oh)
+                    qmin = torch.min(q1, q2)
+                    loss_i = (alpha * plogp[:, i] - qmin).mean()
+                    # TD3+BC anchor per agent (z also frozen for BC)
+                    if args.bc_reg > 0 and not args.oracle_z:
+                        bidx = torch.randint(0, bc_O.shape[0], (B,), device=DEVICE)
+                        zb = encode_kpm(encoder, bc_K[bidx], n_bs, args.remove_own_kpm) if encoder else None
+                        if zb is not None:
+                            zb = zb.detach()
+                        mub, _ = actor.forward(bc_O[bidx], bc_M[bidx], zb)
+                        loss_i = loss_i + args.bc_reg * F.mse_loss(torch.tanh(mub), bc_A[bidx])
+                    opt_a.zero_grad(); loss_i.backward()
+                    nn.utils.clip_grad_norm_(actor_only_params, 10.0)
+                    opt_a.step()
+                    logp_i = plogp[:, i].detach()
+                    logp_all_ordered[i] = logp_i
+                # ---- alpha: ONE update per actor cycle (avg logp across all agents) ----
+                avg_logp = torch.stack(logp_all_ordered, dim=1).mean(dim=1)  # [B]
+                loss_alpha = -(log_alpha * (avg_logp + target_H)).mean()
+                opt_alpha.zero_grad(); loss_alpha.backward(); opt_alpha.step()
+                if args.alpha_min > 0:   # entropy floor: failed runs die at alpha 0.0005-0.0007
+                    with torch.no_grad():
+                        log_alpha.clamp_(min=float(np.log(args.alpha_min)))
+                alpha = log_alpha.exp().detach()
+                # ---- encoder: one joint update after all agents (live z, combined loss) ----
+                if encoder:
+                    z_live = encode_kpm(encoder, k_, n_bs, args.remove_own_kpm)
+                    pa_e, plogp_e = actor.sample(o_, m_, z_live)
+                    loss_enc = 0.0
+                    for i in range(n_bs):
+                        oh = OH[i][None].expand(B, -1)
+                        q1, q2 = critic(s_, pa_e, oh)
+                        loss_enc = loss_enc + (alpha * plogp_e[:, i] - torch.min(q1, q2)).mean()
+                    opt_a.zero_grad(); opt_enc.zero_grad(); loss_enc.backward()
+                    nn.utils.clip_grad_norm_(actor_only_params, 10.0)
+                    nn.utils.clip_grad_norm_(encoder_params, 10.0)
+                    opt_a.step(); opt_enc.step()
 
             # ---- polyak ----
             with torch.no_grad():
                 for p, pt in zip(critic.parameters(), critic_t.parameters()):
                     pt.mul_(1 - args.tau).add_(args.tau * p)
+                if ema_actor is not None:
+                    eta = 1.0 - args.ema_decay
+                    for pe, p in zip(ema_actor.parameters(), actor.parameters()):
+                        pe.mul_(args.ema_decay).add_(eta * p)
+                    if ema_encoder is not None:
+                        for pe, p in zip(ema_encoder.parameters(), encoder.parameters()):
+                            pe.mul_(args.ema_decay).add_(eta * p)
 
         # ---- logging / eval ----
         if step % args.eval_every == 0:
             U, Us = eval_policy(actor, encoder, cfg, n_eval=args.n_eval, T=ep_len,
-                                use_rsrp=args.use_rsrp, remove_own_kpm=args.remove_own_kpm)
+                                use_rsrp=args.use_rsrp, remove_own_kpm=args.remove_own_kpm,
+                                oracle_z=args.oracle_z)
+            pool_push(U, step, "raw", actor, encoder)
+            ema_str = ""
+            if ema_actor is not None:
+                U_ema, _ = eval_policy(ema_actor, ema_encoder, cfg, n_eval=args.n_eval, T=ep_len,
+                                       use_rsrp=args.use_rsrp, remove_own_kpm=args.remove_own_kpm,
+                                       oracle_z=args.oracle_z)
+                pool_push(U_ema, step, "ema", ema_actor, ema_encoder)
+                ema_str = f" | ema {U_ema:8.3f}"
             tag = ""
             if U > best_U:
                 best_U = U
@@ -626,25 +779,49 @@ def train(args):
                 torch.save(best_state, f"results/{args.tag}_best.pt")
             a_now = float(log_alpha.exp().detach())
             pfrac = eval_power_frac(actor, encoder, cfg, use_rsrp=args.use_rsrp,
-                                    remove_own_kpm=args.remove_own_kpm)
+                                    remove_own_kpm=args.remove_own_kpm, oracle_z=args.oracle_z)
             logp(f"step {step:>7} | PF-U {U:8.3f} ± {Us:5.3f} | alpha {a_now:6.4f} | "
-                 f"pwr {pfrac:5.3f} | best {best_U:8.3f} | {time.time()-t0:5.0f}s{tag}")
+                 f"pwr {pfrac:5.3f} | Q {q_dbg_mean:7.2f}/{q_dbg_max:7.2f} | "
+                 f"best {best_U:8.3f}{ema_str} | {time.time()-t0:5.0f}s{tag}")
 
-    # ---- final: restore best, run baselines + z-probe ----
-    if best_state is not None:
+    # ---- final: re-rank top-K ckpts on held-out validation seed, pick true winner ----
+    if best_pool:
+        logp(f"\n=== VALIDATION re-rank (top-{len(best_pool)} ckpts, 50 eps, seed 5151) ===")
+        best_val, best_cand = -1e9, None
+        for c in best_pool:
+            actor.load_state_dict(c["actor"])
+            if encoder is not None and c["enc"] is not None:
+                encoder.load_state_dict(c["enc"])
+            Uv, _ = eval_policy(actor, encoder, cfg, n_eval=50, T=ep_len, seed=5151,
+                                use_rsrp=args.use_rsrp, remove_own_kpm=args.remove_own_kpm,
+                                oracle_z=args.oracle_z)
+            logp(f"  ckpt step {c['step']:>7} [{c['src']}] | train_U {c['U']:8.3f} | val_U {Uv:8.3f}")
+            if Uv > best_val:
+                best_val, best_cand = Uv, c
+        actor.load_state_dict(best_cand["actor"])
+        if encoder is not None and best_cand["enc"] is not None:
+            encoder.load_state_dict(best_cand["enc"])
+        logp(f"  -> selected step {best_cand['step']} [{best_cand['src']}] val_U {best_val:.3f}")
+        torch.save(dict(actor=best_cand["actor"], encoder=best_cand["enc"]),
+                   f"results/{args.tag}_best.pt")
+    elif best_state is not None:
         actor.load_state_dict(best_state["actor"])
         if encoder and best_state["encoder"]:
             encoder.load_state_dict(best_state["encoder"])
 
     logp("\n=== FINAL (best ckpt) ===")
     U, Us = eval_policy(actor, encoder, cfg, n_eval=args.n_eval_final, T=ep_len,
-                        use_rsrp=args.use_rsrp, remove_own_kpm=args.remove_own_kpm)
+                        use_rsrp=args.use_rsrp, remove_own_kpm=args.remove_own_kpm,
+                        oracle_z=args.oracle_z)
     logp(f"{'policy':<22}{U:8.3f} ± {Us:.3f}")
-    if encoder:
+    U0 = Ush = None
+    if encoder or args.oracle_z:
         U0, _ = eval_policy(actor, encoder, cfg, n_eval=args.n_eval_final, T=ep_len, zero_z=True,
-                            use_rsrp=args.use_rsrp, remove_own_kpm=args.remove_own_kpm)
+                            use_rsrp=args.use_rsrp, remove_own_kpm=args.remove_own_kpm,
+                            oracle_z=args.oracle_z)
         Ush, _ = eval_policy(actor, encoder, cfg, n_eval=args.n_eval_final, T=ep_len, shuffle_z=True,
-                             use_rsrp=args.use_rsrp, remove_own_kpm=args.remove_own_kpm)
+                             use_rsrp=args.use_rsrp, remove_own_kpm=args.remove_own_kpm,
+                             oracle_z=args.oracle_z)
         logp(f"{'policy z<-0':<22}{U0:8.3f}   (drop_zero   = {U - U0:+.3f})")
         logp(f"{'policy z<-shuffle':<22}{Ush:8.3f}   (drop_shuffle= {U - Ush:+.3f})")
     floorU, _ = eval_baseline(lambda g, s, w, N: E.bl_equal_power(g, s, w, N),
@@ -654,7 +831,7 @@ def train(args):
     logp(f"{'equal_power (floor)':<22}{floorU:8.3f}")
     logp(f"{'PF-WSR (ceiling)':<22}{ceilU:8.3f}")
     np.save(args.out, dict(policy=U, floor=floorU, ceiling=ceilU,
-                           zero_z=(U0 if encoder else None), best_U=best_U), allow_pickle=True)
+                           zero_z=U0, shuffle_z=Ush, best_U=best_U), allow_pickle=True)
     logf.close()
     return best_U
 
@@ -662,6 +839,10 @@ def train(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--use_z", type=int, default=0)
+    ap.add_argument("--oracle_z", type=int, default=0,
+                    help="1: bypass encoder; feed PF-WSR per-BS power fracs directly as z (upper bound test)")
+    ap.add_argument("--oracle_grid", type=int, default=3,
+                    help="grid size for oracle_z during training (default=3=27 combos, fast); eval always uses cfg.ceiling_grid=6")
     ap.add_argument("--use_rsrp", type=int, default=0,
                     help="1: add g[i][u] for all BSes to actor obs (ue_feat 3->6)")
     ap.add_argument("--reward", default="difference", choices=["difference", "team", "logpf"])
@@ -709,6 +890,27 @@ if __name__ == "__main__":
     ap.add_argument("--isolate_pretrain_steps", type=int, default=0,
                     help="N>0: first N RL steps run with env.isolated=True (no inter-cell interference); "
                          "curriculum learning — actor learns single-cell optimum before coordination challenge")
+    ap.add_argument("--walk_speed", type=float, default=0.0,
+                    help=">0: UE randomwalk (m/step), BS topology fixed at env init")
+    ap.add_argument("--n_step", type=int, default=1,
+                    help="n-step returns: accumulate n transitions before adding to replay, "
+                         "use gamma^n for bootstrapped Q target (1=standard 1-step SAC)")
+    ap.add_argument("--alpha_min", type=float, default=0.0,
+                    help=">0: floor for SAC temperature; failed runs die at alpha 0.0005-0.0007, "
+                         "successful ones sit at 0.0015+ (suggest 0.001)")
+    ap.add_argument("--ema_decay", type=float, default=0.0,
+                    help=">0: keep EMA (Polyak) copy of actor/encoder, eval it alongside raw policy "
+                         "and add to ckpt pool (suggest 0.9999); smooths crash-rebound oscillation")
+    ap.add_argument("--topk", type=int, default=10,
+                    help="keep top-K eval checkpoints; FINAL re-ranks them on a held-out "
+                         "50-ep validation set (seed 5151) before test eval (0=old single-best)")
+    ap.add_argument("--actor_every", type=int, default=1,
+                    help="delayed policy update (TD3-style): actor/alpha/encoder update only "
+                         "every K critic steps; counters the 3:1 actor:critic backward ratio "
+                         "of the sequential loop (suggest 2-3)")
+    ap.add_argument("--q_clamp", type=float, default=0.0,
+                    help=">0: clamp critic targets to [-X, X]; logpf per-BS episodic return is "
+                         "bounded (~[-20, +30]), out-of-range targets are noise (suggest 50)")
     args = ap.parse_args()
     args.log = f"results/{args.tag}_log.txt"
     args.out = f"results/{args.tag}_result.npy"

@@ -31,6 +31,7 @@ class Cfg:
     shadow_dB = 4.0
     pf_beta = 0.05       # PF running-average rate 的 EMA 係數
     ceiling_grid = 6     # 天花板: 每 BS 總功率的 grid 等分數
+    walk_speed = 0.0     # m/step; >0 啟用 UE randomwalk（固定 BS）
 
 
 def dbm_to_w(x):
@@ -42,28 +43,36 @@ PMAX = None  # 由 cfg 設定, 見下
 
 
 # --------------------------- channel ------------------------------
-def gen_scenario(cfg, rng):
-    """佈點 + 關聯。回傳 g[N_BS,N_UE], serv[N_UE](服務 BS index)。"""
-    bs = rng.uniform(0, cfg.area, size=(cfg.N_BS, 2))
-    ue = rng.uniform(0, cfg.area, size=(cfg.N_UE, 2))
+def _channel_from_positions(cfg, bs, ue, rng):
+    """給定 bs[N_BS,2] 和 ue[N_UE,2]，計算 channel gain 與服務關聯。"""
     d = np.linalg.norm(bs[:, None, :] - ue[None, :, :], axis=-1)
     d = np.maximum(d, 1.0)
     PL = 32.4 + 21.0 * np.log10(d) + 20.0 * np.log10(cfg.fc_GHz)
     PL = PL + rng.normal(0.0, cfg.shadow_dB, size=PL.shape)
-    g = 10.0 ** (-PL / 10.0)                      # [N_BS, N_UE] power gain
-    serv = np.argmax(g, axis=0)                   # best-signal association
-    # 確保每個 BS 至少 1 個 UE (否則 bl_equal_power 除以零 / critic 維度問題)。
-    # 注意: 不能單純對空 BS 借一個 UE —— 若從只有 1 個 UE 的 BS 借走會製造新的空 BS,
-    # 且前向掃描不會回頭重檢。改用迴圈: 每次從「UE 數最多」的 BS (必 ≥2) 借出對空 BS
-    # 增益最強的 UE, 直到所有 BS 非空 (空 BS 數量單調遞減, 保證終止)。
+    g = 10.0 ** (-PL / 10.0)
+    return g
+
+
+def _associate(g, cfg, serv_prev=None):
+    """最強 BS 關聯，並確保每個 BS 至少 1 個 UE。"""
+    serv = np.argmax(g, axis=0)
     counts = np.bincount(serv, minlength=cfg.N_BS)
     while np.any(counts == 0):
-        j = int(np.argmin(counts))                # 某個空 BS
-        donor = int(np.argmax(counts))            # UE 最多的 BS (此時必 ≥2)
+        j = int(np.argmin(counts))
+        donor = int(np.argmax(counts))
         cand = np.where(serv == donor)[0]
-        u = cand[int(np.argmax(g[j, cand]))]      # 借出對 j 增益最強的 UE
+        u = cand[int(np.argmax(g[j, cand]))]
         serv[u] = j
         counts = np.bincount(serv, minlength=cfg.N_BS)
+    return serv
+
+
+def gen_scenario(cfg, rng):
+    """佈點 + 關聯。回傳 g[N_BS,N_UE], serv[N_UE](服務 BS index)。"""
+    bs = rng.uniform(0, cfg.area, size=(cfg.N_BS, 2))
+    ue = rng.uniform(0, cfg.area, size=(cfg.N_UE, 2))
+    g = _channel_from_positions(cfg, bs, ue, rng)
+    serv = _associate(g, cfg)
     return g, serv, bs, ue
 
 
@@ -243,13 +252,26 @@ class Env:
         self.rng = np.random.default_rng(seed)
         self.Rbar = np.full(cfg.N_UE, 1e-3)         # PF running-average rate
         self.isolated = False                         # curriculum: zero inter-cell interference
+        # 若啟用 UE randomwalk，BS 位置在 init 時固定，不隨 reset 改變
+        if cfg.walk_speed > 0:
+            self._fixed_bs = self.rng.uniform(0, cfg.area, size=(cfg.N_BS, 2))
+        else:
+            self._fixed_bs = None
 
     def _weights(self):
         return 1.0 / (self.Rbar + 1e-3)
 
     def reset(self):
-        self.g, self.serv, self.bs, self.ue = gen_scenario(self.cfg, self.rng)
-        self.p = bl_equal_power(self.g, self.serv, self._weights(), self.cfg.N_BS)  # 初始功率
+        if self._fixed_bs is not None:
+            # 固定 BS，每 episode 只重置 UE 位置
+            self.bs = self._fixed_bs.copy()
+            self.ue = self.rng.uniform(0, self.cfg.area, size=(self.cfg.N_UE, 2))
+            self.g = _channel_from_positions(self.cfg, self.bs, self.ue, self.rng)
+            self.serv = _associate(self.g, self.cfg)
+        else:
+            self.g, self.serv, self.bs, self.ue = gen_scenario(self.cfg, self.rng)
+        self.Rbar = np.full(self.cfg.N_UE, 1e-3)
+        self.p = bl_equal_power(self.g, self.serv, self._weights(), self.cfg.N_BS)
         return self._obs()
 
     def _obs(self):
@@ -293,6 +315,12 @@ class Env:
             self.Rbar = (1 - self.cfg.pf_beta) * self.Rbar + self.cfg.pf_beta * rate
         info = dict(pf_utility=pf_utility(rate, w), rate=rate,
                     jain=jain([rate[self.serv == i].sum() for i in range(self.cfg.N_BS)]))
+        # UE randomwalk：先算完這步的 reward，再移動 UE，下步的 obs 反映新位置
+        if self.cfg.walk_speed > 0:
+            self.ue = self.ue + self.rng.normal(0.0, self.cfg.walk_speed, self.ue.shape)
+            self.ue = np.clip(self.ue, 0.0, self.cfg.area)
+            self.g = _channel_from_positions(self.cfg, self.bs, self.ue, self.rng)
+            self.serv = _associate(self.g, self.cfg)
         return self._obs(), r, False, info   # full-buffer: 無 terminal
 
 
